@@ -1,0 +1,138 @@
+# Integration workflow for cordis-rs.
+#
+# Longer-running validation that complements the fast gate in
+# .github/workflows/ci.yml:
+#
+#   1. integration: the full test suite (unit, integration and doc tests)
+#      executed three times in a row on one runner so flaky,
+#      timing-dependent tests surface before merge, plus a rustdoc build
+#      (docs/07-validation.md, section 9).
+#   2. coverage: cargo-llvm-cov instrumentation producing an lcov report and
+#      a text summary, uploaded as a workflow artifact.
+#
+# Every job is a gate: any failing step fails the workflow.
+#
+# Optional branch protection (deployment-time repository setting, NOT
+# configured here): if these checks are required, use the names
+#
+#     integration (ubuntu-latest, stable)
+#     coverage (ubuntu-latest, stable)
+
+name: integration
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Deduplicate runs per ref. Superseded PR runs are cancelled; runs on main
+# always run to completion.
+concurrency:
+  group: integration-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  integration:
+    name: integration (ubuntu-latest, stable)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      RUSTUP_TOOLCHAIN: stable
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        timeout-minutes: 5
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+        timeout-minutes: 10
+
+      - name: Cache cargo build artifacts
+        uses: Swatinem/rust-cache@v2
+        timeout-minutes: 10
+
+      # Three consecutive full runs: a failure in ANY run fails this step, so
+      # a test that only passes some of the time cannot slip through. The
+      # suite matches docs/07-validation.md section 9: --all-targets covers
+      # lib, bins, integration and bench targets; doc tests need their own
+      # invocation because --all-targets does not imply --doc.
+      - name: Run full test suite three times (unit + integration + doc tests)
+        run: |
+          set -euo pipefail
+          for run in 1 2 3; do
+            echo "::group::full test run ${run}/3"
+            cargo test --workspace --all-targets --locked
+            cargo test --workspace --doc --locked
+            echo "::endgroup::"
+          done
+        timeout-minutes: 45
+
+      - name: Build rustdoc
+        run: cargo doc --workspace --no-deps --locked
+        timeout-minutes: 15
+
+  coverage:
+    name: coverage (ubuntu-latest, stable)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      RUSTUP_TOOLCHAIN: stable
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        timeout-minutes: 5
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+        timeout-minutes: 10
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+        timeout-minutes: 10
+
+      # No rust-cache here on purpose: cargo-llvm-cov builds into its own
+      # instrumented target directory and prefers a clean baseline so stale
+      # profiles cannot leak between runs.
+      - name: Run tests under coverage instrumentation
+        run: cargo llvm-cov --workspace --all-targets --locked --no-report
+        timeout-minutes: 30
+
+      # The default `cargo llvm-cov report` output is the per-file summary
+      # table with a TOTAL row; it goes to the job log and to summary.txt.
+      # Doc-test coverage requires nightly-only cargo-llvm-cov support, so
+      # coverage measures the same --all-targets suite as the gate above.
+      - name: Generate lcov and summary reports
+        run: |
+          set -euo pipefail
+          mkdir -p coverage
+          cargo llvm-cov report --lcov --output-path coverage/lcov.info
+          cargo llvm-cov report | tee coverage/summary.txt
+        timeout-minutes: 10
+
+      # Reports are published as workflow artifacts only; no external token
+      # is required.
+      #
+      # TODO(codecov): to upload coverage to Codecov later, add a step
+      #   uses: codecov/codecov-action@v5
+      #   with:
+      #     files: coverage/lcov.info
+      #     fail_ci_if_error: true
+      #     token: ${{ secrets.CODECOV_TOKEN }}
+      # and keep it optional so forks without the secret still pass.
+      - name: Upload coverage reports as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage/
+          if-no-files-found: error
+        timeout-minutes: 10

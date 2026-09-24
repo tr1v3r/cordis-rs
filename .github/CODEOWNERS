@@ -1,0 +1,3 @@
+# Default code owners for cordis-rs.
+# Keep in sync with the repository owner configured in Cargo.toml.
+* @tr1v3r
