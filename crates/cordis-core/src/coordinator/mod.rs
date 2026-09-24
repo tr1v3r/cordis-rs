@@ -11,6 +11,7 @@ pub(crate) mod callback;
 pub(crate) mod command;
 pub(crate) mod operation;
 pub(crate) mod retire;
+pub(crate) mod services;
 pub(crate) mod supervisor;
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -22,15 +23,21 @@ use tokio::sync::{mpsc, oneshot, watch};
 use crate::app::AppInner;
 use crate::context::Context;
 use crate::coordinator::operation::Operation;
+use crate::coordinator::services::{
+    DepFacts, ServiceRegistry, SlotKey, StartState, compute_dep_facts,
+};
 use crate::effect::{Cleanup, EffectAdmission, Gate};
 use crate::error::{CleanupError, Error};
 use crate::id::ROOT_DEFINITION_ID;
-use crate::id::{DefinitionId, EffectId, FiberId, GenerationId, OperationId, RuntimeId, TaskId};
+use crate::id::{
+    BindingId, DefinitionId, EffectId, FiberId, GenerationId, OperationId, RuntimeId, TaskId,
+};
 use crate::machine::{
     ConvergeCtx, FailureInfo, FiberRecord, FiberState, OpKind, Outcome, ParentScope, StepEffects,
 };
 use crate::plugin::{AnyConfig, ErasedPlugin};
 use crate::report::{CleanupFailure, CleanupReport, OperationOutcome, ShutdownReport};
+use crate::services::ScopeChain;
 
 pub use command::KernelStats;
 pub(crate) use command::{Command, CommandSender, InternalMsg, RegisterRequest, ScopeRef};
@@ -85,6 +92,7 @@ enum WorkerKey {
     Setup(EffectId),
     Cleanup(EffectId),
     Task(TaskId),
+    ManagedStart(BindingId),
 }
 
 /// Lifecycle state of one ledger entry (docs/03-runtime.md §6).
@@ -120,6 +128,17 @@ enum EntryKind {
         factory: Option<crate::effect::TaskFn>,
         running: bool,
         start_on_activate: bool,
+    },
+    /// A service binding (`provide` / `provide_managed`). The binding is
+    /// staged at admission and publishes with the owning generation's
+    /// commit (or, for active/root owners, immediately — after a managed
+    /// start succeeds). Teardown of the entry retires the binding
+    /// (docs/04 §1.3).
+    Service {
+        binding: BindingId,
+        /// Whether the managed start worker is in flight (`false` for
+        /// plain bindings and after the start settled).
+        start_in_flight: bool,
     },
 }
 
@@ -176,6 +195,7 @@ enum QuiesceWait {
     Setup(EffectId),
     Task(TaskId),
     ChildFiber(FiberId),
+    ManagedStart(BindingId),
 }
 
 struct ShutdownState {
@@ -204,6 +224,9 @@ pub(crate) struct Coordinator {
     effects: HashMap<EffectId, EffectEntry>,
     drains: HashMap<u64, Drain>,
     next_drain_id: u64,
+    /// The service registry (docs/04): slots, bindings and the reverse
+    /// dependency index. Actor-confined like every other table.
+    services: ServiceRegistry,
     limits: Limits,
     stale_discarded: u64,
     runtimes_dropped: usize,
@@ -242,6 +265,7 @@ impl Coordinator {
             effects: HashMap::new(),
             drains: HashMap::new(),
             next_drain_id: 0,
+            services: ServiceRegistry::new(),
             limits,
             stale_discarded: 0,
             runtimes_dropped: 0,
@@ -337,15 +361,22 @@ impl Coordinator {
 
     // ---- Context computation for the reducer ----
 
+    /// The dependency world of `fiber` against the live registry
+    /// (docs/04 §1.2): readiness, the stable stamp, missing reasons and
+    /// the pinned `(BindingId, availability generation)` vector.
+    fn dep_facts_for(&self, fiber: FiberId) -> DepFacts {
+        match self.fibers.get(&fiber) {
+            Some(record) => compute_dep_facts(&self.services, &record.required),
+            None => DepFacts::default(),
+        }
+    }
+
     fn ctx_for(&self, fiber: FiberId) -> ConvergeCtx {
         let Some(record) = self.fibers.get(&fiber) else {
             return ConvergeCtx::default();
         };
         match record.parent {
-            None => ConvergeCtx {
-                parent_ready: None,
-                dependency_stamp: 0,
-            },
+            None => self.dep_facts_for(fiber).converge_ctx(None),
             Some(scope) => {
                 let ready = self
                     .fibers
@@ -355,16 +386,14 @@ impl Coordinator {
                             && parent.active_generation == Some(scope.generation)
                     })
                     .unwrap_or(false);
-                ConvergeCtx {
-                    parent_ready: Some(ready),
-                    dependency_stamp: scope.generation.as_u64(),
-                }
+                self.dep_facts_for(fiber).converge_ctx(Some(ready))
             }
         }
     }
 
     /// Runs one convergence step of `fiber` and interprets its effects.
     fn step_fiber(&mut self, fiber: FiberId) {
+        let facts = self.dep_facts_for(fiber);
         let ctx = self.ctx_for(fiber);
         let mut fx = StepEffects::default();
         if let Some(record) = self.fibers.get_mut(&fiber) {
@@ -374,9 +403,105 @@ impl Coordinator {
                 let _ = record.watch.send(view);
             }
         }
+        // Pin the dependency vector of a freshly assigned generation: the
+        // commit-time verification and later `get` calls compare against
+        // exactly these identities (docs/04 §1.2, §2).
+        if let Some((generation, _)) = &fx.spawn {
+            if let Some(record) = self.fibers.get_mut(&fiber) {
+                if let Some(g) = record.generation.as_mut() {
+                    if g.id == *generation {
+                        g.deps = facts.refs.clone();
+                    }
+                }
+            }
+        }
         self.apply_effects(fiber, fx);
+        self.publish_generation_services(fiber);
         self.start_pending_tasks(fiber);
         self.maybe_start_generation_drain(fiber);
+    }
+
+    /// Publishes every staged binding of `fiber`'s committed generation
+    /// (docs/04 §1.3: the whole generation publishes atomically once,
+    /// after the identity and stamp re-verification inside the same
+    /// serial transition).
+    fn publish_generation_services(&mut self, fiber: FiberId) {
+        let Some(generation) = self.fibers.get(&fiber).and_then(|record| {
+            (record.state == FiberState::Active)
+                .then_some(record.active_generation)
+                .flatten()
+                .filter(|g| record.published_bindings != Some(*g))
+        }) else {
+            return;
+        };
+        let bindings: Vec<BindingId> = self
+            .fibers
+            .get(&fiber)
+            .map(|record| record.all_entries.clone())
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|id| self.effects.get(&id))
+            .filter_map(|entry| match entry.kind {
+                EntryKind::Service { binding, .. } => Some(binding),
+                _ => None,
+            })
+            .collect();
+        let mut changed: Vec<SlotKey> = Vec::new();
+        for binding in bindings {
+            if let Some(slot) = self.services.publish(&binding) {
+                changed.push(slot);
+            }
+        }
+        if let Some(record) = self.fibers.get_mut(&fiber) {
+            record.published_bindings = Some(generation);
+        }
+        for slot in changed {
+            self.notify_slot_changed(&slot);
+        }
+    }
+
+    /// Tries to publish one binding whose managed start just succeeded;
+    /// publishes only when the owning generation is currently committed
+    /// (V25: invisible before start success, never for a replaced
+    /// generation).
+    fn publish_managed_binding(&mut self, binding: BindingId) {
+        let owner = match self.services.get(&binding) {
+            Some(rec) => rec.owner,
+            None => return,
+        };
+        if owner.0 == self.root {
+            if let Some(slot) = self.services.publish(&binding) {
+                self.notify_slot_changed(&slot);
+            }
+            return;
+        }
+        let owner_active = self.fibers.get(&owner.0).is_some_and(|record| {
+            record.state == FiberState::Active && record.active_generation == Some(owner.1)
+        });
+        if owner_active {
+            if let Some(slot) = self.services.publish(&binding) {
+                self.notify_slot_changed(&slot);
+            }
+        }
+    }
+
+    /// Propagates a slot change to its consumers (docs/04 §2): they are
+    /// re-queued, and — synchronously, without waiting for the dirty
+    /// pass — every tracked generation pinned to the old stamp is
+    /// invalidated so its gates close immediately.
+    fn notify_slot_changed(&mut self, slot: &SlotKey) {
+        let dependents = self.services.dependents_of(slot);
+        for fiber in dependents {
+            self.enqueue_dirty(fiber);
+            let stamp = self.dep_facts_for(fiber).stamp;
+            if let Some(record) = self.fibers.get_mut(&fiber) {
+                if let Some(g) = record.generation.as_mut() {
+                    if g.dep_stamp != stamp {
+                        g.dep_invalidated = true;
+                    }
+                }
+            }
+        }
     }
 
     /// Starts the generation drain when a fiber's generation is gone but
@@ -457,7 +582,12 @@ impl Coordinator {
             .get(&fiber)
             .and_then(|record| record.plugin.clone());
         let Some(plugin) = plugin else { return };
-        let ctx = Context::generation(self.app.clone(), fiber, generation);
+        let scopes = self
+            .fibers
+            .get(&fiber)
+            .map(|record| record.scopes.clone())
+            .unwrap_or_else(ScopeChain::root);
+        let ctx = Context::generation(self.app.clone(), fiber, generation, scopes);
         let ticket = supervisor::spawn_activation(
             fiber,
             generation,
@@ -501,6 +631,30 @@ impl Coordinator {
                     }
                 }
             }
+        }
+        // Service bookkeeping: the fiber leaves every reverse-index set,
+        // and any binding still owned by it (a straggler the drains did
+        // not claim) is retired off the actor (D22).
+        let required: Vec<SlotKey> = self
+            .fibers
+            .get(&fiber)
+            .map(|record| {
+                record
+                    .required
+                    .iter()
+                    .map(|slot| (slot.name.clone(), slot.scope.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        for slot in &required {
+            self.services.remove_dependent(slot, fiber);
+        }
+        let (values, slots) = self.services.retire_owned_by(fiber);
+        for value in values {
+            self.retire.submit(Box::new(value));
+        }
+        for slot in &slots {
+            self.notify_slot_changed(slot);
         }
         // Forward to the parent's disposal barrier.
         let parent = self.fibers.get(&fiber).and_then(|record| record.parent);
@@ -568,7 +722,105 @@ impl Coordinator {
                 self.workers.remove(&WorkerKey::Task(task));
                 self.on_task_finished(effect, task, result);
             }
+            InternalMsg::ManagedStartFinished { binding, result } => {
+                self.workers.remove(&WorkerKey::ManagedStart(binding));
+                self.on_managed_start_finished(binding, result);
+            }
         }
+    }
+
+    /// Managed start settled (V25): success publishes the staged binding
+    /// once its owner is committed; failure retires the binding, frees the
+    /// slot and fails the owning generation (the root records the failure
+    /// on the entry instead).
+    fn on_managed_start_finished(&mut self, binding: BindingId, result: TaskResult) {
+        let owner = self.services.get(&binding).map(|rec| rec.owner);
+        let entry_id = self.services.get(&binding).map(|rec| rec.owner_effect);
+        let mut fail: Option<FailureInfo> = None;
+        match result {
+            TaskResult::Done(Ok(())) => {
+                if let Some(rec) = self.services.get_mut(&binding) {
+                    rec.start = StartState::StartSucceeded;
+                }
+                if let Some(entry) = entry_id {
+                    if let Some(entry) = self.effects.get_mut(&entry) {
+                        if let EntryKind::Service {
+                            start_in_flight, ..
+                        } = &mut entry.kind
+                        {
+                            *start_in_flight = false;
+                        }
+                        if entry.state == EntryState::Preparing {
+                            entry.state = EntryState::Sealed;
+                        }
+                    }
+                }
+                self.publish_managed_binding(binding);
+            }
+            TaskResult::Done(Err(error)) => {
+                fail = Some(FailureInfo::Plugin(format!(
+                    "managed service start failed: {error}"
+                )));
+            }
+            TaskResult::Panicked(message) => {
+                fail = Some(FailureInfo::Panicked {
+                    context: "a managed service start",
+                    message,
+                });
+            }
+            TaskResult::Aborted => {
+                // Cancelled by teardown: the drain claims the entry right
+                // after; retirement happens there.
+                if let Some(rec) = self.services.get_mut(&binding) {
+                    rec.start = StartState::StartFailed;
+                }
+            }
+        }
+        if let Some(info) = fail {
+            if let Some(rec) = self.services.get_mut(&binding) {
+                rec.start = StartState::StartFailed;
+            }
+            if let Some(entry) = entry_id {
+                if let Some(entry) = self.effects.get_mut(&entry) {
+                    entry.setup_failed = Some(info.display());
+                    if let EntryKind::Service {
+                        start_in_flight, ..
+                    } = &mut entry.kind
+                    {
+                        *start_in_flight = false;
+                    }
+                    if entry.state == EntryState::Preparing {
+                        entry.state = EntryState::Sealed;
+                    }
+                }
+            }
+            // V25: a failed start leaves no slot occupied.
+            if let Some(value) = self.services.retire(&binding) {
+                self.retire.submit(Box::new(value));
+            }
+            if let Some((fiber, generation)) = owner {
+                if fiber == self.root {
+                    // Root has no generation to fail; the entry's
+                    // recorded setup failure surfaces in the drain report.
+                } else {
+                    let stale = self.fibers.get(&fiber).is_none_or(|record| {
+                        record
+                            .generation
+                            .as_ref()
+                            .is_none_or(|g| g.id != generation)
+                            || record.desired.dispose_requested
+                    });
+                    if !stale {
+                        if let Some(record) = self.fibers.get_mut(&fiber) {
+                            record.fail_generation(info);
+                        }
+                        self.enqueue_dirty(fiber);
+                    }
+                }
+            }
+        }
+        self.satisfy_drain_wait(&QuiesceWait::ManagedStart(binding));
+        self.drive_drains();
     }
 
     fn on_setup_finished(&mut self, effect: EffectId, result: SetupResult) {
@@ -719,11 +971,12 @@ impl Coordinator {
         match cmd {
             Command::Load {
                 scope,
+                scopes,
                 plugin,
                 config,
                 reply,
             } => {
-                let _ = reply.send(self.admit_load(scope, plugin, config));
+                let _ = reply.send(self.admit_load(scope, scopes, plugin, config));
             }
             Command::Update {
                 fiber,
@@ -765,14 +1018,58 @@ impl Coordinator {
             }
             Command::Register {
                 scope,
+                scopes,
                 request,
                 label,
                 reply,
             } => {
-                let _ = reply.send(self.handle_register(scope, request, label));
+                let _ = reply.send(self.handle_register(scope, scopes, request, label));
             }
             Command::DisposeEffect { effect, reply } => {
                 let _ = reply.send(self.handle_dispose_effect(effect));
+            }
+            Command::Provide {
+                scope,
+                scopes,
+                request,
+                reply,
+            } => {
+                let _ = reply.send(self.handle_provide(scope, scopes, request));
+            }
+            Command::ServiceGet {
+                scope,
+                scopes,
+                name,
+                type_id,
+                reply,
+            } => {
+                let _ = reply.send(self.handle_service_get(scope, scopes, name, type_id));
+            }
+            Command::ServiceSet {
+                scope,
+                scopes,
+                name,
+                type_id,
+                value,
+                reply,
+            } => {
+                let _ = reply.send(self.handle_service_set(scope, scopes, name, type_id, value));
+            }
+            Command::SetAvailability {
+                scope,
+                scopes,
+                name,
+                available,
+                reply,
+            } => {
+                let _ = reply.send(self.handle_set_availability(scope, scopes, name, available));
+            }
+            Command::LookupDynamic {
+                scopes,
+                name,
+                reply,
+            } => {
+                let _ = reply.send(self.handle_lookup_dynamic(scopes, name));
             }
         }
     }
@@ -795,6 +1092,7 @@ impl Coordinator {
     fn admit_load(
         &mut self,
         scope: ScopeRef,
+        scopes: ScopeChain,
         plugin: Arc<dyn ErasedPlugin>,
         config: AnyConfig,
     ) -> Result<crate::coordinator::command::Admission, Error> {
@@ -847,6 +1145,33 @@ impl Coordinator {
 
         let meta = plugin.meta();
         let definition = meta.definition_id;
+
+        // Resolve the definition's required services against the loading
+        // view's namespace chain (docs/04 §2). Duplicate declarations of
+        // the same name under different types are refused here — never
+        // silently resolved to the last one.
+        let mut required: Vec<crate::services::RequiredSlot> = Vec::new();
+        for decl in plugin.requires() {
+            let slot = crate::services::RequiredSlot {
+                scope: scopes.resolve(&decl.name),
+                name: decl.name.clone(),
+                type_id: decl.type_id,
+            };
+            if let Some(existing) = required.iter().find(|slot| slot.name == decl.name) {
+                if existing.type_id != decl.type_id {
+                    return Err(Error::InvalidDependency {
+                        service: decl.name.clone(),
+                        reason: format!(
+                            "declared twice with different expected types ({:?} and {:?})",
+                            existing.type_id, decl.type_id
+                        ),
+                    });
+                }
+                continue;
+            }
+            required.push(slot);
+        }
+
         let runtime_id = {
             let runtime = self
                 .runtimes
@@ -865,6 +1190,8 @@ impl Coordinator {
         };
         let mut record = FiberRecord::new_user(fiber, parent_scope, definition, plugin, config);
         record.owner_effect = owner_effect;
+        record.required = required;
+        record.scopes = scopes;
         let op_id = OperationId::alloc_global();
         let (tx, rx) = watch::channel(None);
         let operation = Operation::new(op_id, fiber, rx);
@@ -887,6 +1214,12 @@ impl Coordinator {
             }
         } else if let Some(parent) = self.fibers.get_mut(&parent_scope.fiber) {
             parent.children.push((parent_scope.generation, fiber));
+        }
+        // Reverse dependency index: Pending consumers are registered too,
+        // so providers that appear later find them (docs/04 §2).
+        for slot in &record.required {
+            self.services
+                .add_dependent(&(slot.name.clone(), slot.scope.clone()), fiber);
         }
         self.fibers.insert(fiber, record);
         if let Some(record) = self.fibers.get_mut(&fiber) {
@@ -1031,15 +1364,68 @@ impl Coordinator {
             record
                 .generation
                 .as_ref()
-                .is_some_and(|g| g.id == generation && !g.cancelled)
+                .is_some_and(|g| g.id == generation && !g.cancelled && !g.dep_invalidated)
                 && matches!(record.state, FiberState::Starting | FiberState::Active)
                 && !record.desired.dispose_requested
+        })
+    }
+
+    /// Resolves the admission of a registration scope shared by effects,
+    /// tasks and service bindings: the root fiber admits directly (the
+    /// host's own scope), generation scopes must be current, effect
+    /// scopes must be current *and* have their synchronous gate open
+    /// (docs/03 §6.2). A dependency-epoch invalidation closes generation
+    /// scopes the same way a desired change does (docs/04 §2).
+    fn admit_registration_scope(
+        &self,
+        scope: ScopeRef,
+    ) -> Result<(FiberId, GenerationId, Option<EffectId>), Error> {
+        match scope {
+            ScopeRef::Root => Ok((self.root, self.root_generation, None)),
+            ScopeRef::Generation { fiber, generation } => {
+                if !self.scope_generation_ok(fiber, generation) {
+                    return Err(Error::StaleGeneration { fiber });
+                }
+                Ok((fiber, generation, None))
+            }
+            ScopeRef::Effect {
+                fiber,
+                generation,
+                effect,
+            } => {
+                let gate_open = self.effects.get(&effect).is_some_and(|entry| {
+                    entry.fiber == fiber
+                        && entry.generation == generation
+                        && !entry.state.is_terminal()
+                        && entry.gate.is_open()
+                });
+                if !gate_open {
+                    return Err(Error::InactiveScope);
+                }
+                if !self.scope_generation_ok(fiber, generation) {
+                    return Err(Error::StaleGeneration { fiber });
+                }
+                Ok((fiber, generation, Some(effect)))
+            }
+        }
+    }
+
+    /// Whether `(fiber, generation)` is a currently published owner: the
+    /// generation is committed and the fiber is Active (the root fiber
+    /// always is).
+    fn owner_is_published(&self, fiber: FiberId, generation: GenerationId) -> bool {
+        if fiber == self.root {
+            return true;
+        }
+        self.fibers.get(&fiber).is_some_and(|record| {
+            record.state == FiberState::Active && record.active_generation == Some(generation)
         })
     }
 
     fn handle_register(
         &mut self,
         scope: ScopeRef,
+        scopes: ScopeChain,
         request: RegisterRequest,
         label: String,
     ) -> Result<EffectAdmission, Error> {
@@ -1174,7 +1560,7 @@ impl Coordinator {
 
         // Entry published; user code may start (docs/03 §6.1).
         if let Some(setup) = setup_to_spawn {
-            let ctx = Context::effect_scope(self.app.clone(), fiber, generation, id);
+            let ctx = Context::effect_scope(self.app.clone(), fiber, generation, id, scopes);
             let ticket = supervisor::spawn_setup(id, setup, ctx, gate, self.internal_tx.clone());
             self.workers.insert(WorkerKey::Setup(id), ticket);
         }
@@ -1190,6 +1576,332 @@ impl Coordinator {
             fiber,
             generation,
             task: task_id,
+        })
+    }
+
+    // ---- Service registry commands (docs/04 §1.3, §2) ----
+
+    /// `provide` / `provide_managed` (V25): stage the slot, own it
+    /// through an effect entry, and publish according to the owner's
+    /// publication rules.
+    fn handle_provide(
+        &mut self,
+        scope: ScopeRef,
+        scopes: ScopeChain,
+        request: crate::coordinator::command::ProvideRequest,
+    ) -> Result<EffectAdmission, Error> {
+        self.refuse_if_shutting_down()?;
+        let (fiber, generation, parent_effect) = self.admit_registration_scope(scope)?;
+
+        // The ledger entry is published before any user code (the managed
+        // start) runs (I05); the entry id doubles as the binding's owner
+        // edge, so it is allocated first.
+        let id = EffectId::alloc_global();
+        let slot = (request.name.clone(), scopes.resolve(&request.name));
+        let (start_state, managed) = match request.managed {
+            None => (StartState::NoStartRequired, None),
+            Some((start, stop)) => (StartState::StartPending, Some((start, stop))),
+        };
+        // Staging reserves the slot: a duplicate provider is refused
+        // here, never stacked (docs/04 §1.3).
+        let binding = self.services.stage(
+            slot,
+            request.type_id,
+            request.value,
+            (fiber, generation),
+            id,
+            start_state,
+        )?;
+
+        let mut entry = EffectEntry {
+            fiber,
+            generation,
+            parent: parent_effect,
+            label: format!("service {}", request.name),
+            state: EntryState::Sealed,
+            kind: EntryKind::Service {
+                binding,
+                start_in_flight: managed.is_some(),
+            },
+            cleanup: None,
+            gate: Gate::new(),
+            children: Vec::new(),
+            child_fibers: Vec::new(),
+            dispose_ops: Vec::new(),
+            final_outcome: None,
+            drain: None,
+            setup_failed: None,
+            unconfirmed: false,
+        };
+        let mut start_to_spawn = None;
+        if let Some((start, stop)) = managed {
+            entry.cleanup = Some(stop);
+            entry.state = EntryState::Preparing;
+            start_to_spawn = Some(start);
+        }
+        self.effects.insert(id, entry);
+        if let Some(parent) = parent_effect {
+            if let Some(parent_entry) = self.effects.get_mut(&parent) {
+                parent_entry.children.push(id);
+            }
+        }
+        if let Some(record) = self.fibers.get_mut(&fiber) {
+            if parent_effect.is_none() {
+                record.entries.push(id);
+            }
+            record.all_entries.push(id);
+            record.hold += 1;
+        }
+
+        // Publication rules (docs/04 §1.3): plain bindings publish
+        // immediately for Active/root owners and with the generation
+        // commit for Starting owners; managed bindings publish only after
+        // start success, and only while the owner is published.
+        if start_to_spawn.is_none() && self.owner_is_published(fiber, generation) {
+            if let Some(slot) = self.services.publish(&binding) {
+                self.notify_slot_changed(&slot);
+            }
+        }
+        if let Some(start) = start_to_spawn {
+            if self.workers.len() >= self.limits.max_workers {
+                let info = FailureInfo::Capacity(format!(
+                    "managed service start refused: live worker budget ({}) exhausted",
+                    self.limits.max_workers
+                ));
+                // V25: a refused start leaves no slot occupied.
+                if let Some(value) = self.services.retire(&binding) {
+                    self.retire.submit(Box::new(value));
+                }
+                if let Some(entry) = self.effects.get_mut(&id) {
+                    entry.setup_failed = Some(info.display());
+                    entry.state = EntryState::Sealed;
+                    if let EntryKind::Service {
+                        start_in_flight, ..
+                    } = &mut entry.kind
+                    {
+                        *start_in_flight = false;
+                    }
+                }
+                if fiber != self.root {
+                    if let Some(record) = self.fibers.get_mut(&fiber) {
+                        record.fail_generation(info);
+                    }
+                    self.enqueue_dirty(fiber);
+                }
+            } else {
+                let ticket =
+                    supervisor::spawn_managed_start(binding, start, self.internal_tx.clone());
+                self.workers
+                    .insert(WorkerKey::ManagedStart(binding), ticket);
+            }
+        }
+
+        Ok(EffectAdmission {
+            effect: id,
+            fiber,
+            generation,
+            task: None,
+        })
+    }
+
+    /// `get` (docs/02-api.md §5): declared dependencies or own bindings
+    /// only; the lease pins the exact binding of this generation's
+    /// dependency snapshot — a later provider replacement is not followed.
+    fn handle_service_get(
+        &mut self,
+        scope: ScopeRef,
+        scopes: ScopeChain,
+        name: String,
+        type_id: std::any::TypeId,
+    ) -> Result<crate::coordinator::command::LeasePayload, Error> {
+        let (fiber, generation, _) = match scope {
+            ScopeRef::Root => (self.root, self.root_generation, None),
+            other => self.admit_registration_scope(other)?,
+        };
+        let slot = (name.clone(), scopes.resolve(&name));
+        let namespace = slot.1.as_str();
+
+        // Read permission first (docs/02-api.md §5): a generation context
+        // may read its declared dependencies and its own bindings; the
+        // host root reads only what it provides itself — everything else
+        // is `lookup_dynamic`'s explicit dynamism. The check precedes
+        // existence so an undeclared name is an explicit permission error
+        // even when no binding exists (V24).
+        let declared_any = self.fibers.get(&fiber).is_some_and(|record| {
+            record
+                .required
+                .iter()
+                .any(|required| required.name == name && required.scope == slot.1)
+        });
+        let binding = self.services.binding_at(&slot);
+        let own = binding.is_some_and(|binding| {
+            self.services
+                .get(&binding)
+                .is_some_and(|rec| rec.owner == (fiber, generation))
+        });
+        if !declared_any && !own {
+            return Err(Error::UndeclaredDependency { service: name });
+        }
+
+        // Existence, visibility, type and availability.
+        let binding = binding.ok_or_else(|| Error::ServiceMissing {
+            service: name.clone(),
+            namespace: namespace.to_owned(),
+        })?;
+        let rec = self.services.get(&binding).expect("just resolved");
+        if !rec.published {
+            return Err(Error::ServiceMissing {
+                service: name.clone(),
+                namespace: namespace.to_owned(),
+            });
+        }
+        if rec.type_id != type_id {
+            // A declared name under another expected type, or an own
+            // binding read through a differently-typed key: an explicit
+            // type error, never a silent cross-type read (V24).
+            return Err(Error::ServiceTypeMismatch {
+                service: name,
+                namespace: namespace.to_owned(),
+            });
+        }
+        if !rec.available {
+            return Err(Error::ServiceMissing {
+                service: name,
+                namespace: namespace.to_owned(),
+            });
+        }
+        // Pin check (docs/04 §1.3: "no generation may suddenly observe
+        // another provider"): the binding and its availability generation
+        // must still match this generation's dependency snapshot.
+        if fiber != self.root && declared_any {
+            let pinned = self.fibers.get(&fiber).and_then(|record| {
+                record
+                    .generation
+                    .as_ref()
+                    .filter(|g| g.id == generation)
+                    .and_then(|g| {
+                        g.deps
+                            .iter()
+                            .find(|dep| dep.name == name && dep.binding == binding)
+                    })
+                    .map(|dep| dep.availability_generation)
+            });
+            match pinned {
+                Some(availability) if availability == rec.availability_generation => {}
+                _ => return Err(Error::StaleGeneration { fiber }),
+            }
+        }
+
+        Ok(crate::coordinator::command::LeasePayload {
+            binding,
+            cell: rec.cell.clone(),
+        })
+    }
+
+    /// `set` (docs/04 §1.2): owner-only value replacement resolved
+    /// against the calling view's chain; bumps the value revision and
+    /// never the dependency epoch — consumers are not reloaded (V21).
+    fn handle_service_set(
+        &mut self,
+        scope: ScopeRef,
+        scopes: ScopeChain,
+        name: String,
+        type_id: std::any::TypeId,
+        value: AnyConfig,
+    ) -> Result<(), Error> {
+        self.refuse_if_shutting_down()?;
+        let (fiber, generation, _) = self.admit_registration_scope(scope)?;
+        let binding = self.owner_binding(&name, &scopes)?;
+        let (owner, bound_type, namespace) = {
+            let rec = self.services.get(&binding).expect("resolved above");
+            (rec.owner, rec.type_id, rec.scope.as_str())
+        };
+        if owner != (fiber, generation) {
+            return Err(Error::InvalidOwner);
+        }
+        if bound_type != type_id {
+            return Err(Error::ServiceTypeMismatch {
+                service: name,
+                namespace,
+            });
+        }
+        if !self.services.set_value(&binding, value) {
+            return Err(Error::ServiceMissing {
+                service: name,
+                namespace,
+            });
+        }
+        Ok(())
+    }
+
+    /// `set_available` (docs/04 §2): owner-only explicit availability.
+    /// The false transition synchronously invalidates consumers pinned to
+    /// the old stamp — their gates close at admission, not at the next
+    /// dirty pass; the true transition bumps the availability generation
+    /// again so an old Starting ticket can never publish (V26).
+    fn handle_set_availability(
+        &mut self,
+        scope: ScopeRef,
+        scopes: ScopeChain,
+        name: String,
+        available: bool,
+    ) -> Result<(), Error> {
+        self.refuse_if_shutting_down()?;
+        let (fiber, generation, _) = self.admit_registration_scope(scope)?;
+        let binding = self.owner_binding(&name, &scopes)?;
+        let owner_ok = self
+            .services
+            .get(&binding)
+            .is_some_and(|rec| rec.owner == (fiber, generation));
+        if !owner_ok {
+            return Err(Error::InvalidOwner);
+        }
+        if let Some((_, slot)) = self.services.set_available(&binding, available) {
+            self.notify_slot_changed(&slot);
+        }
+        Ok(())
+    }
+
+    /// Resolves the slot a provider-side operation (`set`,
+    /// `set_available`) addresses: the binding visible or staged at the
+    /// calling view's resolved slot. Owner checks follow at the call
+    /// site; a missing slot is a missing service.
+    fn owner_binding(&self, name: &str, scopes: &ScopeChain) -> Result<BindingId, Error> {
+        let slot = (name.to_owned(), scopes.resolve(name));
+        self.services
+            .binding_at(&slot)
+            .ok_or_else(|| Error::ServiceMissing {
+                service: name.to_owned(),
+                namespace: slot.1.as_str(),
+            })
+    }
+
+    /// `lookup_dynamic` (docs/02-api.md §5): live registry read by name,
+    /// no dependency tracking, no reloads, no generation admission — the
+    /// caller explicitly accepted dynamic behavior.
+    fn handle_lookup_dynamic(
+        &mut self,
+        scopes: ScopeChain,
+        name: String,
+    ) -> Result<crate::coordinator::command::DynamicLeasePayload, Error> {
+        let slot = (name.clone(), scopes.resolve(&name));
+        let rec = self
+            .services
+            .published(&slot)
+            .ok_or_else(|| Error::ServiceMissing {
+                service: name.clone(),
+                namespace: slot.1.as_str(),
+            })?;
+        if !rec.available {
+            return Err(Error::ServiceMissing {
+                service: name,
+                namespace: slot.1.as_str(),
+            });
+        }
+        Ok(crate::coordinator::command::DynamicLeasePayload {
+            binding: rec.id,
+            cell: rec.cell.clone(),
+            type_id: rec.type_id,
         })
     }
 
@@ -1369,6 +2081,7 @@ impl Coordinator {
         let mut setup_in_flight: Vec<EffectId> = Vec::new();
         let mut tasks_running: Vec<(EffectId, TaskId)> = Vec::new();
         let mut child_fibers: Vec<FiberId> = Vec::new();
+        let mut managed_starts: Vec<BindingId> = Vec::new();
         for entry_id in &queue {
             let Some(entry) = self.effects.get(entry_id) else {
                 continue;
@@ -1381,14 +2094,26 @@ impl Coordinator {
                     tasks_running.push((*entry_id, *task));
                 }
             }
+            if let EntryKind::Service {
+                binding,
+                start_in_flight,
+            } = &entry.kind
+            {
+                if *start_in_flight {
+                    managed_starts.push(*binding);
+                }
+            }
             child_fibers.extend(entry.child_fibers.iter().copied());
         }
 
         // Claim pass: mark Disposing, close gates, detach never-started
         // task factories (their Drop is user code — retire off-actor),
-        // and detach claimed entries from their parents (exactly-once:
-        // a parent drain must never re-walk a claimed subtree).
+        // detach claimed entries from their parents (exactly-once: a
+        // parent drain must never re-walk a claimed subtree), and retire
+        // service bindings synchronously — discovery and new snapshots
+        // stop before any cleanup future runs (docs/04 §1.3).
         let mut retire_factories: Vec<crate::effect::TaskFn> = Vec::new();
+        let mut retired_bindings: Vec<BindingId> = Vec::new();
         for entry_id in &queue {
             let Some(entry) = self.effects.get_mut(entry_id) else {
                 continue;
@@ -1401,6 +2126,9 @@ impl Coordinator {
                     retire_factories.push(factory);
                 }
             }
+            if let EntryKind::Service { binding, .. } = &entry.kind {
+                retired_bindings.push(*binding);
+            }
             if let Some(parent) = entry.parent {
                 if let Some(parent_entry) = self.effects.get_mut(&parent) {
                     parent_entry.children.retain(|c| *c != *entry_id);
@@ -1409,6 +2137,19 @@ impl Coordinator {
         }
         for factory in retire_factories {
             self.retire.submit(Box::new(factory));
+        }
+        let mut retired_slots: Vec<SlotKey> = Vec::new();
+        for binding in &retired_bindings {
+            let slot = self
+                .services
+                .get(binding)
+                .map(|rec| (rec.name.clone(), rec.scope.clone()));
+            if let Some(value) = self.services.retire(binding) {
+                self.retire.submit(Box::new(value));
+            }
+            if let Some(slot) = slot {
+                retired_slots.push(slot);
+            }
         }
         if let Some(record) = self.fibers.get_mut(&fiber) {
             record.entries.retain(|e| !queue.contains(e));
@@ -1431,6 +2172,17 @@ impl Coordinator {
         for child in &child_fibers {
             self.apply_dispose_target(*child);
             quiesce.push(QuiesceWait::ChildFiber(*child));
+        }
+        for binding in &managed_starts {
+            if let Some(ticket) = self.workers.get(&WorkerKey::ManagedStart(*binding)) {
+                ticket.abort.abort();
+            }
+            quiesce.push(QuiesceWait::ManagedStart(*binding));
+        }
+        // Consumers observe the retirement immediately: dirty re-queue
+        // plus synchronous stamp invalidation (docs/04 §2).
+        for slot in &retired_slots {
+            self.notify_slot_changed(slot);
         }
 
         // The drain itself holds the fiber's landing until it settles.
@@ -1469,6 +2221,9 @@ impl Coordinator {
                 QuiesceWait::ChildFiber(f) => {
                     drain.quiesce.retain(|w| *w != QuiesceWait::ChildFiber(*f))
                 }
+                QuiesceWait::ManagedStart(b) => drain
+                    .quiesce
+                    .retain(|w| *w != QuiesceWait::ManagedStart(*b)),
             }
         }
     }
@@ -1710,6 +2465,7 @@ impl Coordinator {
             dirty_queue_len: self.dirty_queue.len(),
             retirement_pending,
             retirement_completed,
+            service_bindings_live: self.services.bindings_live(),
         }
     }
 
@@ -1870,6 +2626,11 @@ impl Coordinator {
                     items.push(Box::new(factory) as retire::RetireItem);
                 }
             }
+        }
+        // Service payloads are user-owned values too: retire every cell's
+        // contents off the actor (D22).
+        for value in self.services.take_all() {
+            items.push(Box::new(value) as retire::RetireItem);
         }
         for record in self.fibers.values_mut() {
             if let Some(config) = record.desired.config.take() {

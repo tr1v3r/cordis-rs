@@ -142,7 +142,7 @@ pub(crate) enum FailureInfo {
 }
 
 impl FailureInfo {
-    fn display(&self) -> String {
+    pub(crate) fn display(&self) -> String {
         match self {
             FailureInfo::Plugin(message) => message.clone(),
             FailureInfo::Panicked { context, message } => format!("{context}: {message}"),
@@ -180,6 +180,18 @@ pub(crate) struct GenRecord {
     /// The desired state moved on; this generation's result must not
     /// commit.
     pub(crate) cancelled: bool,
+    /// The dependency world moved on (epoch/availability change); this
+    /// generation's result must not commit and must not land `Failed` —
+    /// the world, not the plugin, changed (docs/04 §1.2).
+    pub(crate) dep_invalidated: bool,
+    /// The dependency stamp this generation was assigned under; the
+    /// commit point re-verifies it in the same actor transition
+    /// (docs/03-runtime.md §3 【提交】).
+    pub(crate) dep_stamp: u64,
+    /// The pinned dependency vector: sorted `(BindingId, availability
+    /// generation)` pairs (docs/04 §1.2). Attached by the actor when the
+    /// spawn effect is interpreted; the reducer treats it as opaque.
+    pub(crate) deps: Vec<crate::services::DepRef>,
     /// The worker's terminal result, once reported.
     pub(crate) outcome: Option<Outcome>,
     /// The generation was published (committed).
@@ -192,12 +204,15 @@ pub(crate) struct GenRecord {
 }
 
 impl GenRecord {
-    fn new(id: GenerationId, revision: u64, config: AnyConfig) -> Self {
+    fn new(id: GenerationId, revision: u64, config: AnyConfig, dep_stamp: u64) -> Self {
         Self {
             id,
             revision,
             config: Some(config),
             cancelled: false,
+            dep_invalidated: false,
+            dep_stamp,
+            deps: Vec::new(),
             outcome: None,
             committed: false,
             children_revoked: false,
@@ -234,16 +249,27 @@ pub(crate) struct ParentScope {
 /// Cross-fiber context the actor computes before converging a fiber.
 ///
 /// Keeps the reducer pure: it cannot read other fibers' records, so the
-/// actor supplies the parent readiness answer and the dependency stamp.
-#[derive(Debug, Clone, Copy, Default)]
+/// actor supplies the parent readiness answer and the dependency world
+/// (docs/04 §1.2: the dependency stamp is the sorted
+/// `(BindingId, availability generation)` vector, hashed; a fiber with
+/// missing requirements is `Unavailable{reasons}`, which is never
+/// conflated with the empty ready vector).
+#[derive(Debug, Clone, Default)]
 pub(crate) struct ConvergeCtx {
     /// `None` for the root fiber (always ready); otherwise whether the
     /// parent scope `(fiber, generation)` is currently published.
     pub(crate) parent_ready: Option<bool>,
-    /// Identity of the dependency world this activation would enter. A
-    /// change of stamp permits retrying a previously failed activation
-    /// even at the same desired revision (docs/03-runtime.md §2).
-    pub(crate) dependency_stamp: u64,
+    /// Whether every required service slot currently resolves to a
+    /// published, available binding.
+    pub(crate) deps_ready: bool,
+    /// Identity of the dependency world. A change of stamp permits
+    /// retrying a previously failed activation even at the same desired
+    /// revision (docs/03-runtime.md §2) and invalidates in-flight or
+    /// committed generations pinned to the old stamp.
+    pub(crate) dep_stamp: u64,
+    /// Why dependencies are not ready; entries carry namespaces
+    /// (docs/04 §4.5).
+    pub(crate) dep_missing: Vec<String>,
 }
 
 /// Effects one reducer step asks the actor to perform.
@@ -282,7 +308,7 @@ pub(crate) struct FiberRecord {
     pub(crate) active_generation: Option<GenerationId>,
     /// Revision of the last committed generation.
     pub(crate) committed_revision: Option<u64>,
-    /// `(revision, dependency_stamp)` of the last activation attempt —
+    /// `(revision, dep_stamp)` of the last activation attempt —
     /// suppresses retry loops (V10).
     pub(crate) attempted: Option<(u64, u64)>,
     pub(crate) pending_ops: Vec<PendingOp>,
@@ -317,6 +343,16 @@ pub(crate) struct FiberRecord {
     /// The effect entry owning this fiber, when loaded through a derived
     /// scope.
     pub(crate) owner_effect: Option<crate::id::EffectId>,
+    /// Required services resolved against the loading view's namespace
+    /// chain at admission (docs/04 §2). Fixed per fiber: changing
+    /// requirements is a new load, never a mutation of the live fiber.
+    pub(crate) required: Vec<crate::services::RequiredSlot>,
+    /// The namespace chain of the loading view; generation contexts
+    /// inherit it so providers and consumers resolve identical slots.
+    pub(crate) scopes: crate::services::ScopeChain,
+    /// The generation whose staged service bindings were published
+    /// (docs/04 §1.3: publication happens once per generation commit).
+    pub(crate) published_bindings: Option<GenerationId>,
     /// Watch stream of the fiber's state view. The actor keeps the
     /// original receiver alive: a watch channel whose receivers are all
     /// gone is closed, and later sends would silently stop updating.
@@ -363,6 +399,9 @@ impl FiberRecord {
             drain_quarantine: None,
             drain_report: None,
             owner_effect: None,
+            required: Vec::new(),
+            scopes: crate::services::ScopeChain::root(),
+            published_bindings: None,
             watch,
             watch_rx,
         }
@@ -411,6 +450,9 @@ impl FiberRecord {
             drain_quarantine: None,
             drain_report: None,
             owner_effect: None,
+            required: Vec::new(),
+            scopes: crate::services::ScopeChain::root(),
+            published_bindings: None,
             watch,
             watch_rx,
         }
@@ -591,8 +633,9 @@ impl FiberRecord {
         if let Some(g) = self.generation.as_ref() {
             let Some(outcome) = &g.outcome else {
                 // Worker still running: nothing may commit. If the desired
-                // state moved on we are draining; show Stopping.
-                if g.cancelled && self.state != FiberState::Stopping {
+                // state moved on, or the dependency world under this
+                // generation changed, we are draining; show Stopping.
+                if (g.cancelled || g.dep_invalidated) && self.state != FiberState::Stopping {
                     self.set_state(FiberState::Stopping);
                 }
                 return;
@@ -602,10 +645,20 @@ impl FiberRecord {
             // happened — the message matched this generation, and this
             // generation was assigned for `revision`; committing further
             // requires the desired state to still be exactly that.
+            // Commit point (docs §3 【提交】): the triple check already
+            // happened — the message matched this generation, and this
+            // generation was assigned for `revision`. The dependency world
+            // is re-verified here as well: the generation may only commit
+            // while the stamp it was assigned under is still current
+            // (docs/04 §1.2: availability flips invalidate old Starting
+            // tickets; docs/04 §2: pre-publication verification happens in
+            // the same serial actor transition).
+            let deps_ok = !g.dep_invalidated && ctx.deps_ready && ctx.dep_stamp == g.dep_stamp;
             if !g.cancelled
                 && !g.committed
                 && matches!(outcome, Outcome::Succeeded)
                 && self.desired.matches(g.revision)
+                && deps_ok
             {
                 let generation_id = g.id;
                 let revision = g.revision;
@@ -627,7 +680,7 @@ impl FiberRecord {
             }
 
             let g = self.generation.as_ref().expect("still present");
-            let steady = !g.cancelled && g.committed && self.desired.matches(g.revision);
+            let steady = !g.cancelled && g.committed && self.desired.matches(g.revision) && deps_ok;
             if steady {
                 if self.state != FiberState::Active {
                     self.set_state(FiberState::Active);
@@ -686,6 +739,7 @@ impl FiberRecord {
                 self.active_generation = None;
                 self.committed_revision = None;
             }
+            let dep_invalidated = g.dep_invalidated;
             let mut failure = g.forced_failure.take();
             if failure.is_none() {
                 if let Some(Outcome::Failed(info)) = g.outcome.take() {
@@ -693,7 +747,13 @@ impl FiberRecord {
                 }
             }
             if let Some(info) = failure {
-                if !self.desired.dispose_requested {
+                // A dependency-epoch change discarded this generation: the
+                // plugin did not necessarily misbehave, the world moved.
+                // The release converges toward Pending (deps still gone)
+                // or a fresh generation (deps present under a new stamp);
+                // landing `Failed` is reserved for plugin-owned failures
+                // (docs/04 §1.2, docs/03 §2).
+                if !self.desired.dispose_requested && !dep_invalidated {
                     self.last_error = Some(info.display());
                     self.land_failure = Some((info, g.revision));
                 }
@@ -797,7 +857,10 @@ impl FiberRecord {
             if !ready {
                 let reason = "parent owner is not active".to_owned();
                 self.pending_reason = Some(reason.clone());
-                if matches!(self.state, FiberState::Starting | FiberState::Stopping) {
+                if matches!(
+                    self.state,
+                    FiberState::Starting | FiberState::Active | FiberState::Stopping
+                ) {
                     self.set_state(FiberState::Pending);
                 }
                 // The activation request itself settles as Pending: it
@@ -814,15 +877,41 @@ impl FiberRecord {
                 return;
             }
         }
+
+        // Required services gate the next generation the same way
+        // (docs/03-runtime.md §3 【协调】): missing dependencies hold the
+        // fiber in Pending — a stable waiting state, never an error. The
+        // reasons carry namespaces so operators can see *where* the
+        // service was looked for (docs/04 §4.5).
+        if !ctx.deps_ready {
+            let missing = ctx.dep_missing.clone();
+            if matches!(
+                self.state,
+                FiberState::Starting | FiberState::Active | FiberState::Stopping
+            ) {
+                self.set_state(FiberState::Pending);
+            }
+            self.pending_reason = Some(missing.join("; "));
+            self.resolve_activation_op(
+                self.desired.revision,
+                Arc::new(OperationOutcome::Pending {
+                    missing: missing.clone(),
+                }),
+                fx,
+            );
+            return;
+        }
         self.pending_reason = None;
 
         let revision = self.desired.revision;
-        let stamp = ctx.dependency_stamp;
+        let stamp = ctx.dep_stamp;
         if self.attempted == Some((revision, stamp)) {
             // V10: this exact desired state was already attempted. It
             // either committed (Active, handled above), failed (Failed)
             // or lost readiness; no automatic retry until the desired
-            // revision or the dependency stamp changes.
+            // revision or the dependency stamp changes. Dependency-driven
+            // reload therefore restarts exactly once per world change —
+            // never in a loop (docs/03-runtime.md §2).
             return;
         }
 
@@ -832,7 +921,12 @@ impl FiberRecord {
             return;
         };
         let generation_id = GenerationId::alloc_global();
-        self.generation = Some(GenRecord::new(generation_id, revision, config.clone()));
+        self.generation = Some(GenRecord::new(
+            generation_id,
+            revision,
+            config.clone(),
+            stamp,
+        ));
         self.attempted = Some((revision, stamp));
         self.set_state(FiberState::Starting);
         fx.spawn = Some((generation_id, config));
@@ -890,6 +984,9 @@ mod tests {
         fn config_type(&self) -> TypeId {
             TypeId::of::<()>()
         }
+        fn requires(&self) -> Vec<crate::services::RequiredDecl> {
+            Vec::new()
+        }
         fn activate(
             self: Arc<Self>,
             _ctx: crate::Context,
@@ -919,14 +1016,36 @@ mod tests {
     fn ready_ctx() -> ConvergeCtx {
         ConvergeCtx {
             parent_ready: Some(true),
-            dependency_stamp: 7,
+            deps_ready: true,
+            dep_stamp: 7,
+            dep_missing: Vec::new(),
         }
     }
 
     fn not_ready_ctx() -> ConvergeCtx {
         ConvergeCtx {
             parent_ready: Some(false),
-            dependency_stamp: 7,
+            deps_ready: true,
+            dep_stamp: 7,
+            dep_missing: Vec::new(),
+        }
+    }
+
+    fn ready_ctx_at(dep_stamp: u64) -> ConvergeCtx {
+        ConvergeCtx {
+            parent_ready: Some(true),
+            deps_ready: true,
+            dep_stamp,
+            dep_missing: Vec::new(),
+        }
+    }
+
+    fn missing_ctx_at(dep_stamp: u64, reason: &str) -> ConvergeCtx {
+        ConvergeCtx {
+            parent_ready: Some(true),
+            deps_ready: false,
+            dep_stamp,
+            dep_missing: vec![reason.to_owned()],
         }
     }
 
@@ -1329,5 +1448,156 @@ mod tests {
         record.activation_done(generation_id, WorkerResult::Done(Ok(())), &mut fx);
         record.converge(&mut fx, &ready_ctx());
         assert_eq!(record.state, FiberState::Disposed);
+    }
+
+    /// V19 core: missing required services hold the fiber in Pending
+    /// without ever spawning; the activation request settles as Pending
+    /// with the missing reasons.
+    #[test]
+    fn missing_dependencies_hold_the_fiber_pending() {
+        let reason = "service \"db\" is not provided in namespace default";
+        let missing_ctx = || missing_ctx_at(99, reason);
+        let mut record = user_record();
+        let op = new_op(&mut record, 1);
+
+        let mut fx = StepEffects::default();
+        record.converge(&mut fx, &missing_ctx());
+        assert_eq!(record.state, FiberState::Pending);
+        assert!(fx.spawn.is_none());
+        assert!(
+            record
+                .status()
+                .pending_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("namespace default"))
+        );
+        assert!(matches!(
+            &*outcomes(&fx).iter().find(|(id, _)| *id == op).unwrap().1,
+            OperationOutcome::Pending { missing } if missing.len() == 1
+        ));
+
+        // Repeated convergence at the same world: no loop, still Pending.
+        for _ in 0..3 {
+            let mut fx = StepEffects::default();
+            record.converge(&mut fx, &missing_ctx());
+            assert!(fx.spawn.is_none());
+        }
+
+        // The dependency appears (new stamp): a generation is assigned.
+        record.converge(&mut fx, &ready_ctx());
+        assert_eq!(record.state, FiberState::Starting);
+        assert!(fx.spawn.is_some());
+    }
+
+    /// V19 core: an active generation whose dependency stamp changed is
+    /// torn down; with the dependency gone the fiber lands Pending, and
+    /// when it returns a *new* generation activates.
+    #[test]
+    fn dependency_epoch_change_tears_down_active_generation() {
+        let mut record = user_record();
+        let mut fx = StepEffects::default();
+        record.converge(&mut fx, &ready_ctx());
+        let (generation_1, _) = fx.spawn.clone().expect("spawn");
+        record.activation_done(generation_1, WorkerResult::Done(Ok(())), &mut fx);
+        record.converge(&mut fx, &ready_ctx());
+        assert_eq!(record.state, FiberState::Active);
+        assert_eq!(record.active_generation, Some(generation_1));
+
+        // The world changes and the dependency disappears (the actor
+        // marks the generation invalidated when it observes the new
+        // stamp; here the invalidate flag plus the new facts arrive).
+        record.generation.as_mut().unwrap().dep_invalidated = true;
+        record.converge(
+            &mut fx,
+            &missing_ctx_at(99, "service \"db\" is not provided in namespace default"),
+        );
+        // The fixture has no ledger entries (hold == 0), so the release
+        // and the Pending landing happen in the same step.
+        assert_eq!(record.state, FiberState::Pending);
+        assert!(record.active_generation.is_none());
+        assert!(
+            record
+                .status()
+                .pending_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("namespace default"))
+        );
+
+        // The dependency returns under a *different* stamp: new
+        // generation, not a resurrection of the old one.
+        record.converge(&mut fx, &ready_ctx_at(8));
+        assert_eq!(record.state, FiberState::Starting);
+        let (generation_2, _) = fx.spawn.clone().expect("new spawn");
+        assert_ne!(generation_1, generation_2);
+    }
+
+    /// V22/V26 core: a Starting generation invalidated by an availability
+    /// flip never commits, even when its worker reports success — the
+    /// success belongs to the old stamp.
+    #[test]
+    fn invalidated_starting_generation_cannot_commit_late_success() {
+        let mut record = user_record();
+        let mut fx = StepEffects::default();
+        record.converge(&mut fx, &ready_ctx());
+        let (generation_1, _) = fx.spawn.clone().expect("spawn");
+
+        // Availability flips false then true while the worker runs: the
+        // stamp changed under the ticket (7 -> 8).
+        record.generation.as_mut().unwrap().dep_invalidated = true;
+        record.converge(&mut fx, &ready_ctx_at(8));
+        assert_eq!(record.state, FiberState::Stopping);
+
+        // The worker finishes successfully — too late: it belonged to
+        // stamp 7, and the current world is stamp 8.
+        record.activation_done(generation_1, WorkerResult::Done(Ok(())), &mut fx);
+        record.converge(&mut fx, &ready_ctx_at(8));
+        assert_ne!(record.state, FiberState::Active);
+        assert!(record.active_generation.is_none());
+
+        // A fresh generation under the new stamp succeeds instead.
+        let (generation_2, _) = fx.spawn.clone().expect("new spawn");
+        assert_ne!(generation_1, generation_2);
+        record.activation_done(generation_2, WorkerResult::Done(Ok(())), &mut fx);
+        record.converge(&mut fx, &ready_ctx_at(8));
+        assert_eq!(record.state, FiberState::Active);
+        assert_eq!(record.active_generation, Some(generation_2));
+    }
+
+    /// A generation discarded because the dependency world moved on does
+    /// not land `Failed` — the failure belonged to the old world and the
+    /// fiber retries under the new stamp (docs/03 §2).
+    #[test]
+    fn dependency_invalidated_failure_does_not_land_failed() {
+        let mut record = user_record();
+        let mut fx = StepEffects::default();
+        record.converge(&mut fx, &ready_ctx());
+        let (generation_1, _) = fx.spawn.clone().expect("spawn");
+
+        record.generation.as_mut().unwrap().dep_invalidated = true;
+        record.activation_done(
+            generation_1,
+            WorkerResult::Done(Err(PluginError::from("apply exploded"))),
+            &mut fx,
+        );
+        record.converge(&mut fx, &ready_ctx_at(8));
+        // The world is ready again under a *new* stamp: immediate retry,
+        // not a Failed landing.
+        assert_eq!(record.state, FiberState::Starting);
+        assert!(fx.spawn.is_some());
+        assert!(record.land_failure.is_none());
+
+        // Contrast: the same failure without invalidation lands Failed
+        // and does not retry at the same stamp.
+        let (generation_2, _) = fx.spawn.clone().expect("spawn");
+        record.activation_done(
+            generation_2,
+            WorkerResult::Done(Err(PluginError::from("apply exploded"))),
+            &mut fx,
+        );
+        record.converge(&mut fx, &ready_ctx_at(8));
+        assert_eq!(record.state, FiberState::Failed);
+        let mut fx = StepEffects::default();
+        record.converge(&mut fx, &ready_ctx_at(8));
+        assert!(fx.spawn.is_none(), "no retry loop at the same stamp");
     }
 }

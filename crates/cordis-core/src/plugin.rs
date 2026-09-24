@@ -39,6 +39,10 @@ pub(crate) struct PluginMeta {
 pub(crate) trait ErasedPlugin: Send + Sync {
     fn meta(&self) -> &PluginMeta;
     fn config_type(&self) -> TypeId;
+    /// The required-service declarations attached to this definition value
+    /// (docs/02-api.md §2: `.requires(...)`). Resolved against the
+    /// loading view's namespace chain at admission (docs/04 §2).
+    fn requires(&self) -> Vec<crate::services::RequiredDecl>;
     fn activate(self: Arc<Self>, ctx: Context, config: AnyConfig) -> PluginFuture;
 }
 
@@ -89,6 +93,37 @@ impl<C> Plugin<C> {
     /// Returns the identity allocated when this definition was created.
     pub fn definition_id(&self) -> DefinitionId {
         self.erased.meta().definition_id
+    }
+
+    /// Returns a copy of this definition with one more required service
+    /// (docs/02-api.md §2).
+    ///
+    /// The returned value keeps the **same** [`DefinitionId`] (it is the
+    /// same definition; `require` only records what a load of this value
+    /// will wait for). Declarations are therefore fixed per `Plugin`
+    /// value: attach requirements before loading, and declare different
+    /// sets by chaining from the same base definition.
+    ///
+    /// Duplicate declarations of the same `(name, type)` collapse; the
+    /// same name under a different type is refused at load admission with
+    /// [`Error::InvalidDependency`](crate::Error::InvalidDependency),
+    /// never silently resolved to the last writer (docs/04 §2).
+    pub fn require<T>(self, key: crate::ServiceKey<T>) -> Self
+    where
+        T: Send + Sync + 'static,
+    {
+        let mut requires = self.erased.requires();
+        requires.push(crate::services::RequiredDecl {
+            name: key.name().to_owned(),
+            type_id: TypeId::of::<T>(),
+        });
+        Self {
+            erased: Arc::new(TypedRequire {
+                base: Arc::clone(&self.erased),
+                requires,
+            }),
+            _config: PhantomData,
+        }
     }
 
     /// Returns the erased definition behind the typed facade.
@@ -155,6 +190,12 @@ where
         TypeId::of::<C>()
     }
 
+    fn requires(&self) -> Vec<crate::services::RequiredDecl> {
+        // Requirements attach through `Plugin::require`, which wraps the
+        // definition in [`TypedRequire`]; the base declares none.
+        Vec::new()
+    }
+
     fn activate(self: Arc<Self>, ctx: Context, config: AnyConfig) -> PluginFuture {
         let this = self;
         match config.downcast::<C>() {
@@ -167,6 +208,32 @@ where
                 ))
             }),
         }
+    }
+}
+
+/// Erased wrapper that layers required-service declarations onto a base
+/// definition without disturbing its identity (docs/02-api.md §2).
+struct TypedRequire {
+    base: Arc<dyn ErasedPlugin>,
+    requires: Vec<crate::services::RequiredDecl>,
+}
+
+impl ErasedPlugin for TypedRequire {
+    fn meta(&self) -> &PluginMeta {
+        self.base.meta()
+    }
+
+    fn config_type(&self) -> TypeId {
+        self.base.config_type()
+    }
+
+    fn requires(&self) -> Vec<crate::services::RequiredDecl> {
+        self.requires.clone()
+    }
+
+    fn activate(self: Arc<Self>, ctx: Context, config: AnyConfig) -> PluginFuture {
+        let base = Arc::clone(&self.base);
+        base.activate(ctx, config)
     }
 }
 
@@ -196,6 +263,29 @@ mod tests {
         let second = define("metrics", |_ctx, _cfg: Arc<Config>| async { Ok(()) });
         assert_eq!(first.name(), second.name());
         assert_ne!(first.definition_id(), second.definition_id());
+    }
+
+    #[test]
+    fn require_keeps_definition_identity_and_records_declarations() {
+        let base = define("metrics", |_ctx, _cfg: Arc<Config>| async { Ok(()) });
+        let with_deps = base.clone().require(crate::ServiceKey::<Config>::new("db"));
+
+        // Same definition: same identity, same name, one runtime per app.
+        assert_eq!(with_deps.definition_id(), base.definition_id());
+        assert_eq!(with_deps.name(), base.name());
+
+        let decls = with_deps.erased.requires();
+        assert_eq!(decls.len(), 1);
+        assert_eq!(decls[0].name, "db");
+        assert_eq!(decls[0].type_id, TypeId::of::<Config>());
+
+        // Chaining accumulates; identical duplicates collapse at admission
+        // (docs/04 §2), while the base stays declaration-free.
+        assert!(base.erased.requires().is_empty());
+        let chained = with_deps
+            .clone()
+            .require(crate::ServiceKey::<String>::new("cache"));
+        assert_eq!(chained.erased.requires().len(), 2);
     }
 
     #[tokio::test]

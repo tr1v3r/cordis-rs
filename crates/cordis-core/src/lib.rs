@@ -31,8 +31,20 @@
 //!   aggregated reports, panic/timeout quarantine; supervised
 //!   `spawn_prepare`/`spawn_on_activate` tasks; child fibers owned by
 //!   their registering scope; a retirement lane on the blocking pool.
+//! - the **service system (P4)**: `(ServiceName, ScopeId)` slots with
+//!   type checks and [`BindingId`] identity (provider fiber +
+//!   generation + per-app seq); typed leases whose snapshots follow
+//!   `set` and refuse after retirement; staged provides that publish
+//!   atomically with the generation commit; managed services gated on
+//!   a supervised start; explicit availability whose transitions bump
+//!   a monotonic availability generation; a reverse dependency index
+//!   driving epoch-stamped reloads — dependency worlds are hashed into
+//!   per-generation stamps, and every provider change invalidates the
+//!   consumers pinned to the old stamp synchronously; namespace
+//!   chains with `fork`/`isolate`/`isolate_shared` where isolated
+//!   views never fall back to outer namespaces.
 //!
-//! Services and events (P4–P5) attach to these seams.
+//! Events (P5) attach to these seams.
 //!
 //! ## Boundaries
 //!
@@ -120,6 +132,7 @@ mod id;
 mod machine;
 mod plugin;
 mod report;
+mod services;
 
 pub use app::{App, AppBuilder, WeakApp};
 pub use context::{Context, ErasedFiberHandle, FiberHandle, LoadReceipt};
@@ -135,6 +148,7 @@ pub use plugin::{Plugin, define};
 pub use report::{
     CleanupFailure, CleanupReport, OperationOutcome, ShutdownOptions, ShutdownReport,
 };
+pub use services::{DynamicLease, ScopeId, ServiceKey, ServiceLease};
 
 /// Version of the kernel crate, mirroring the crate version at compile
 /// time. Used by the loader scaffold to assert the workspace links

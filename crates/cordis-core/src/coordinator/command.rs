@@ -6,18 +6,20 @@
 //! messages are unbounded in the channel but strictly bounded in count:
 //! every accepted worker emits exactly one terminal message.
 
+use std::any::TypeId;
 use std::sync::Arc;
 
 use tokio::sync::{mpsc, oneshot, watch};
 
 use super::supervisor::{CleanupResult, SetupResult, TaskResult, WorkerResult};
 use crate::coordinator::operation::Operation;
-use crate::effect::{CleanupFuture, EffectAdmission, SetupFn, TaskFn};
+use crate::effect::{Cleanup, CleanupFuture, EffectAdmission, SetupFn, TaskFn};
 use crate::error::Error;
-use crate::id::{DefinitionId, EffectId, FiberId, GenerationId, RuntimeId, TaskId};
+use crate::id::{BindingId, DefinitionId, EffectId, FiberId, GenerationId, RuntimeId, TaskId};
 use crate::machine::FiberView;
 use crate::plugin::AnyConfig;
 use crate::report::{ShutdownOptions, ShutdownReport};
+use crate::services::{LeaseCell, ManagedStartFn, ScopeChain};
 
 /// The scope a [`Context`](crate::Context) submits from.
 ///
@@ -63,9 +65,12 @@ pub(crate) struct Admission {
 /// Replies are one-shot channels; a dropped reply receiver (caller
 /// cancelled after admission) must never panic the actor.
 pub(crate) enum Command {
-    /// Admit a new fiber of a definition under a scope.
+    /// Admit a new fiber of a definition under a scope. `scopes` is the
+    /// namespace chain of the loading view: required services resolve
+    /// against it (docs/04 §2) and generation contexts inherit it.
     Load {
         scope: ScopeRef,
+        scopes: ScopeChain,
         plugin: Arc<dyn crate::plugin::ErasedPlugin>,
         config: AnyConfig,
         reply: oneshot::Sender<Result<Admission, Error>>,
@@ -111,9 +116,12 @@ pub(crate) enum Command {
     },
     /// Register an effect entry, a plain cleanup or a supervised task
     /// under a scope. The entry is published before any user code runs
-    /// (I05); setup/task bodies execute on supervised workers.
+    /// (I05); setup/task bodies execute on supervised workers. `scopes`
+    /// is the namespace chain the registering view carries; derived
+    /// effect contexts inherit it.
     Register {
         scope: ScopeRef,
+        scopes: ScopeChain,
         request: RegisterRequest,
         label: String,
         reply: oneshot::Sender<Result<EffectAdmission, Error>>,
@@ -123,6 +131,75 @@ pub(crate) enum Command {
         effect: EffectId,
         reply: oneshot::Sender<Result<Operation, Error>>,
     },
+    /// Stage a service binding under a slot (docs/04 §1.3).
+    Provide {
+        scope: ScopeRef,
+        scopes: ScopeChain,
+        request: ProvideRequest,
+        reply: oneshot::Sender<Result<EffectAdmission, Error>>,
+    },
+    /// Acquire a typed lease on a declared (or own) service binding
+    /// (docs/02-api.md §5).
+    ServiceGet {
+        scope: ScopeRef,
+        scopes: ScopeChain,
+        name: String,
+        type_id: TypeId,
+        reply: oneshot::Sender<Result<LeasePayload, Error>>,
+    },
+    /// Replace the value of a binding owned by this scope; bumps the
+    /// value revision only (docs/04 §1.2: never reloads consumers). The
+    /// calling view's chain resolves which slot is targeted.
+    ServiceSet {
+        scope: ScopeRef,
+        scopes: ScopeChain,
+        name: String,
+        type_id: TypeId,
+        value: AnyConfig,
+        reply: oneshot::Sender<Result<(), Error>>,
+    },
+    /// Provider-side explicit availability flip (docs/04 §2). Resolved
+    /// against the calling view's chain like `set`.
+    SetAvailability {
+        scope: ScopeRef,
+        scopes: ScopeChain,
+        name: String,
+        available: bool,
+        reply: oneshot::Sender<Result<(), Error>>,
+    },
+    /// Live-registry lookup by name with no dependency tracking
+    /// (docs/02-api.md §5).
+    LookupDynamic {
+        scopes: ScopeChain,
+        name: String,
+        reply: oneshot::Sender<Result<DynamicLeasePayload, Error>>,
+    },
+}
+
+/// The erased payload of a `provide` request.
+pub(crate) struct ProvideRequest {
+    pub(crate) name: String,
+    pub(crate) type_id: TypeId,
+    pub(crate) value: AnyConfig,
+    /// `Some((start, stop))` for managed services: the binding publishes
+    /// only after `start` succeeds on a supervised worker, and `stop`
+    /// runs as the entry's cleanup (V25).
+    pub(crate) managed: Option<(ManagedStartFn, Cleanup)>,
+}
+
+/// A lease handed back to the typed layer: the pinned binding plus its
+/// shared value cell. The actor has already type-checked the binding
+/// against the requested `TypeId`.
+pub(crate) struct LeasePayload {
+    pub(crate) binding: BindingId,
+    pub(crate) cell: Arc<LeaseCell>,
+}
+
+/// The erased lease handed back by `lookup_dynamic`.
+pub(crate) struct DynamicLeasePayload {
+    pub(crate) binding: BindingId,
+    pub(crate) cell: Arc<LeaseCell>,
+    pub(crate) type_id: TypeId,
 }
 
 /// The erased payload of a registration request.
@@ -166,6 +243,13 @@ pub(crate) enum InternalMsg {
         task: TaskId,
         result: TaskResult,
     },
+    /// A managed service's start worker finished (or panicked, or was
+    /// aborted). Success publishes the staged binding once the owning
+    /// generation is committed (V25).
+    ManagedStartFinished {
+        binding: BindingId,
+        result: TaskResult,
+    },
 }
 
 /// Immutable kernel-wide diagnostics snapshot.
@@ -193,6 +277,8 @@ pub struct KernelStats {
     pub retirement_pending: u64,
     /// User-owned values retired (dropped on the lane) so far.
     pub retirement_completed: u64,
+    /// Service bindings currently staged or published (P4).
+    pub service_bindings_live: usize,
 }
 
 /// Handle to the coordinator's external mailbox.

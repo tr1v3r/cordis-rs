@@ -187,6 +187,41 @@ pub(crate) fn spawn_task(
     WorkerTicket { abort }
 }
 
+/// Spawns a managed service's start worker plus its watcher (docs/02-api.md
+/// §5, V25).
+///
+/// The binding stays invisible until this worker reports success and its
+/// owner is published. Aborted starts mirror aborted setups: cancellation
+/// is treated as a synchronous drop of the future's own resources.
+pub(crate) fn spawn_managed_start(
+    binding: crate::id::BindingId,
+    start: crate::services::ManagedStartFn,
+    internal: mpsc::UnboundedSender<InternalMsg>,
+) -> WorkerTicket {
+    let worker: JoinHandle<TaskResult> = tokio::spawn(async move {
+        CALLBACK_ORIGIN
+            .scope((), async {
+                match catch_unwind(AssertUnwindSafe(start)) {
+                    Err(panic) => TaskResult::Panicked(panic_payload(panic)),
+                    Ok(fut) => TaskResult::Done(fut.await),
+                }
+            })
+            .await
+    });
+    let abort = worker.abort_handle();
+    tokio::spawn(async move {
+        let result = match worker.await {
+            Ok(report) => report,
+            Err(join_error) if join_error.is_panic() => {
+                TaskResult::Panicked(panic_payload(join_error.into_panic()))
+            }
+            Err(_) => TaskResult::Aborted,
+        };
+        let _ = internal.send(InternalMsg::ManagedStartFinished { binding, result });
+    });
+    WorkerTicket { abort }
+}
+
 /// Spawns the activation worker for `(fiber, generation)` plus its
 /// watcher, returning the abort ticket the actor registers.
 ///
@@ -314,6 +349,9 @@ mod tests {
         }
         fn config_type(&self) -> std::any::TypeId {
             std::any::TypeId::of::<Config>()
+        }
+        fn requires(&self) -> Vec<crate::services::RequiredDecl> {
+            Vec::new()
         }
         fn activate(
             self: Arc<Self>,

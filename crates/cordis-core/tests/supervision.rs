@@ -426,7 +426,18 @@ async fn user_drops_retire_off_the_actor() {
     }
     assert!(DROPPED.load(Ordering::SeqCst) >= 2);
 
-    let stats = app.stats().await.unwrap();
+    // The lane decrements `retirement_pending` right after the user
+    // `Drop` returns inside its blocking closure, so observing the drops
+    // does not yet prove the counters moved: poll them cooperatively too,
+    // the same way as `DROPPED` above.
+    let mut stats = app.stats().await.unwrap();
+    for _ in 0..10_000 {
+        if stats.retirement_pending == 0 && stats.retirement_completed >= 2 {
+            break;
+        }
+        tokio::task::yield_now().await;
+        stats = app.stats().await.unwrap();
+    }
     assert_eq!(stats.retirement_pending, 0, "lane drained: {stats:?}");
     assert!(stats.retirement_completed >= 2);
 

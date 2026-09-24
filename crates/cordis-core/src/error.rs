@@ -41,21 +41,47 @@ pub enum Error {
         /// Name of the service.
         service: String,
     },
-    /// A declared service is not currently provided in the reachable scopes.
+    /// A declared service is not currently provided in the resolved
+    /// namespace.
+    ///
+    /// `namespace` is the rendered [`ScopeId`](crate::ScopeId) the lookup
+    /// resolved to (for example `default` or `unique(7)`). Isolated views
+    /// report the isolated namespace here instead of falling back to a
+    /// parent namespace.
     ServiceMissing {
         /// Name of the service.
         service: String,
+        /// The namespace that was searched, as rendered by the scope.
+        namespace: String,
     },
     /// A service is registered or requested under a different type than the
     /// one declared for its key.
     ServiceTypeMismatch {
         /// Name of the service.
         service: String,
+        /// The namespace the binding was found in.
+        namespace: String,
     },
     /// Another provider already occupies the service slot in this scope.
     ServiceExists {
         /// Name of the service.
         service: String,
+        /// The namespace of the occupied slot.
+        namespace: String,
+    },
+    /// A dependency declaration is inconsistent (for example the same name
+    /// declared twice with different expected types).
+    InvalidDependency {
+        /// Name of the service whose declaration conflicts.
+        service: String,
+        /// Why the declaration was rejected.
+        reason: String,
+    },
+    /// The binding a lease was pinned to has been retired; new snapshots
+    /// are refused. Arcs already taken out of the lease remain valid.
+    ServiceRetired {
+        /// The retired binding.
+        binding: crate::id::BindingId,
     },
     /// A registration is being operated on by a scope that does not own it.
     InvalidOwner,
@@ -126,19 +152,28 @@ impl fmt::Display for Error {
                 f,
                 "service {service:?} is used but was not declared as a dependency"
             ),
-            Error::ServiceMissing { service } => {
-                write!(f, "service {service:?} is not currently provided")
-            }
-            Error::ServiceTypeMismatch { service } => write!(
+            Error::ServiceMissing { service, namespace } => write!(
                 f,
-                "service {service:?} is bound with a different type than requested"
+                "service {service:?} is not currently provided in namespace {namespace}"
             ),
-            Error::ServiceExists { service } => {
+            Error::ServiceTypeMismatch { service, namespace } => write!(
+                f,
+                "service {service:?} is bound with a different type than requested in namespace {namespace}"
+            ),
+            Error::ServiceExists { service, namespace } => write!(
+                f,
+                "service {service:?} already has a provider in namespace {namespace}"
+            ),
+            Error::InvalidDependency { service, reason } => {
                 write!(
                     f,
-                    "service {service:?} already has a provider in this scope"
+                    "invalid dependency declaration for {service:?}: {reason}"
                 )
             }
+            Error::ServiceRetired { binding } => write!(
+                f,
+                "service binding {binding:?} is retired; leases no longer serve snapshots"
+            ),
             Error::InvalidOwner => write!(f, "the registration is not owned by this scope"),
             Error::WouldDeadlock => write!(
                 f,
@@ -204,6 +239,17 @@ impl fmt::Display for PluginError {
 impl StdError for PluginError {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
         self.0.source()
+    }
+}
+
+impl From<Error> for PluginError {
+    /// Wraps a framework refusal so plugin bodies can propagate it with
+    /// `?`: a service slot conflict, a stale scope or a missing
+    /// dependency that the plugin cannot handle is an activation
+    /// failure, and the original [`Error`] stays observable through
+    /// `Display`/`source`.
+    fn from(error: Error) -> Self {
+        Self(Box::new(error))
     }
 }
 
@@ -278,6 +324,33 @@ mod tests {
             err.to_string(),
             "invalid configuration: app name must not be empty"
         );
+    }
+
+    #[test]
+    fn service_errors_report_the_namespace() {
+        let missing = Error::ServiceMissing {
+            service: "db".to_owned(),
+            namespace: "unique(7)".to_owned(),
+        };
+        let text = missing.to_string();
+        assert!(text.contains("\"db\""), "names the service: {text}");
+        assert!(text.contains("unique(7)"), "names the namespace: {text}");
+
+        let exists = Error::ServiceExists {
+            service: "db".to_owned(),
+            namespace: "default".to_owned(),
+        };
+        assert!(exists.to_string().contains("namespace default"));
+
+        let retired = Error::ServiceRetired {
+            binding: crate::id::BindingId::new(
+                crate::id::FiberId::alloc_global(),
+                crate::id::GenerationId::alloc_global(),
+                3,
+            ),
+        };
+        // Identity only: no configuration content in the rendered error.
+        assert!(retired.to_string().contains("BindingId(fiber="));
     }
 
     #[test]

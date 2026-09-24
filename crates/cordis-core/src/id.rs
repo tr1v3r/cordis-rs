@@ -90,12 +90,6 @@ id_newtype!(
 );
 
 id_newtype!(
-    /// Identity of one service binding: a provider instance publishing a
-    /// service into a scope. Managed by the service registry from P4.
-    BindingId
-);
-
-id_newtype!(
     /// Identity of one lifecycle operation receipt (load, update, restart,
     /// dispose). Issued by the coordinator from P2.
     OperationId
@@ -183,6 +177,70 @@ impl TaskId {
     }
 }
 
+/// Identity of one service binding (docs/04-services-events-loader.md §1.2).
+///
+/// A binding is the triple `(provider fiber, provider generation,
+/// registration seq)`. The seq is allocated monotonically inside one app
+/// (the registry lives in the app's coordinator actor), so every
+/// registration — including a re-provide of the same slot by the same
+/// fiber after a restart — yields a fresh `BindingId`. Consumers pin this
+/// id in their dependency stamps, which is what makes the unbind/re-provide
+/// (ABA) sequence observable: the new binding can never masquerade as the
+/// old epoch.
+///
+/// Equality, ordering and hashing cover all three components.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct BindingId {
+    provider_fiber: FiberId,
+    provider_generation: GenerationId,
+    seq: u64,
+}
+
+impl BindingId {
+    /// Assembles a binding identity from its three components.
+    ///
+    /// Called by the service registry when a provide is admitted; the seq
+    /// comes from the registry's per-app counter.
+    pub(crate) fn new(
+        provider_fiber: FiberId,
+        provider_generation: GenerationId,
+        seq: u64,
+    ) -> Self {
+        Self {
+            provider_fiber,
+            provider_generation,
+            seq,
+        }
+    }
+
+    /// The fiber whose generation published this binding.
+    pub fn provider_fiber(self) -> FiberId {
+        self.provider_fiber
+    }
+
+    /// The generation of the provider fiber that published this binding.
+    pub fn provider_generation(self) -> GenerationId {
+        self.provider_generation
+    }
+
+    /// The per-app monotonic registration sequence number.
+    pub fn seq(self) -> u64 {
+        self.seq
+    }
+}
+
+impl fmt::Debug for BindingId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "BindingId(fiber={}, generation={}, seq={})",
+            self.provider_fiber.as_u64(),
+            self.provider_generation.as_u64(),
+            self.seq
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -231,5 +289,30 @@ mod tests {
         let rendered = format!("{runtime:?}");
         assert!(rendered.starts_with("RuntimeId("));
         assert!(rendered.ends_with(')'));
+    }
+
+    #[test]
+    fn binding_ids_are_unique_per_registration() {
+        let fiber = FiberId::alloc_global();
+        let generation = GenerationId::alloc_global();
+        let first = BindingId::new(fiber, generation, 1);
+        let second = BindingId::new(fiber, generation, 2);
+        // Same provider, same generation, different seq: distinct epochs.
+        assert_ne!(first, second);
+
+        // A restart of the same fiber produces a new generation component.
+        let next_generation = GenerationId::alloc_global();
+        let restarted = BindingId::new(fiber, next_generation, 3);
+        assert_ne!(first, restarted);
+        assert_ne!(second, restarted);
+
+        // The debug form prints only identity numbers.
+        let rendered = format!("{first:?}");
+        assert!(rendered.starts_with("BindingId(fiber="));
+        assert_eq!(
+            first.provider_fiber(),
+            fiber,
+            "round trip of the provider fiber"
+        );
     }
 }

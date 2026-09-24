@@ -18,6 +18,7 @@ use crate::error::{CleanupError, Error, PluginError};
 use crate::id::{DefinitionId, EffectId, FiberId, GenerationId, RuntimeId};
 use crate::machine::{FiberState, FiberStatus, FiberView};
 use crate::plugin::Plugin;
+use crate::services::{DynamicLease, ScopeChain, ServiceKey, ServiceLease};
 
 /// An immutable view onto an app (docs/02-api.md §7).
 ///
@@ -33,6 +34,7 @@ use crate::plugin::Plugin;
 pub struct Context {
     app: Weak<AppInner>,
     scope: ScopeRef,
+    scopes: ScopeChain,
 }
 
 impl Clone for Context {
@@ -40,6 +42,7 @@ impl Clone for Context {
         Self {
             app: self.app.clone(),
             scope: self.scope,
+            scopes: self.scopes.clone(),
         }
     }
 }
@@ -82,6 +85,7 @@ impl Context {
         Self {
             app: Arc::downgrade(inner),
             scope: ScopeRef::Root,
+            scopes: ScopeChain::root(),
         }
     }
 
@@ -89,19 +93,23 @@ impl Context {
         app: Weak<AppInner>,
         fiber: FiberId,
         generation: GenerationId,
+        scopes: ScopeChain,
     ) -> Self {
         Self {
             app,
             scope: ScopeRef::Generation { fiber, generation },
+            scopes,
         }
     }
 
-    /// The derived scope context handed to an effect setup body.
+    /// The derived scope context handed to an effect setup body; derives
+    /// the namespace chain of the registering view.
     pub(crate) fn effect_scope(
         app: Weak<AppInner>,
         fiber: FiberId,
         generation: GenerationId,
         effect: EffectId,
+        scopes: ScopeChain,
     ) -> Self {
         Self {
             app,
@@ -110,6 +118,7 @@ impl Context {
                 generation,
                 effect,
             },
+            scopes,
         }
     }
 
@@ -121,18 +130,38 @@ impl Context {
         }
     }
 
-    /// Creates another immutable view of the same scope
-    /// (docs/02-api.md §7). Forking never extends lifetimes; service
-    /// visibility rules attach in P4.
+    /// Creates another immutable view of the same scope and the same
+    /// service namespaces (docs/02-api.md §7, docs/04 §1.1). Forking
+    /// never extends lifetimes and never changes ownership.
     pub fn fork(&self) -> Context {
         self.clone()
     }
 
-    /// Creates an isolated view: in P3 this is still the same scope —
-    /// isolation domains arrive with the service registry (P4) and will
-    /// only change view resolution, never ownership.
-    pub fn isolate(&self) -> Context {
-        self.clone()
+    /// Derives a view that resolves `service` in a fresh isolated
+    /// namespace (docs/04 §1.1).
+    ///
+    /// Lookups of `service` through the derived view address only that
+    /// namespace: a missing provider is an error naming the isolated
+    /// namespace, **never** a fallback to the outer namespaces. The
+    /// original view is untouched (docs/06 P4.6: scope parameters change
+    /// by deriving views, never by mutating an active context).
+    pub fn isolate(&self, service: impl Into<String>) -> Context {
+        let service = service.into();
+        let mut next = self.clone();
+        next.scopes = self.scopes.isolate(&service);
+        next
+    }
+
+    /// Derives a view that resolves `service` in the shared namespace
+    /// `label`: views that share a label for a service see each other's
+    /// bindings, without colliding with the default namespace or with the
+    /// same label used for a different service (docs/04 §1.1).
+    pub fn isolate_shared(&self, service: impl Into<String>, label: impl Into<String>) -> Context {
+        let service = service.into();
+        let label = label.into();
+        let mut next = self.clone();
+        next.scopes = self.scopes.isolate_shared(&service, &label);
+        next
     }
 
     /// The fiber this context is scoped to, if it is a generation context.
@@ -190,9 +219,11 @@ impl Context {
     {
         let inner = self.app.upgrade().ok_or(Error::HostClosed)?;
         let config: crate::plugin::AnyConfig = Arc::new(config);
+        let scopes = self.scopes.clone();
         let admission = inner
             .submit(|reply| Command::Load {
                 scope: self.scope,
+                scopes,
                 plugin: plugin.erased_clone(),
                 config,
                 reply,
@@ -312,6 +343,193 @@ impl Context {
         Ok(self.registration_from(admission))
     }
 
+    // ---- Service registry API (docs/02-api.md §5, docs/04 §1.3) ----
+
+    /// Publishes `value` under `key` (docs/04 §1.3).
+    ///
+    /// The binding is owned by this scope: staging reserves the slot
+    /// (duplicate providers in the same namespace are refused with
+    /// [`Error::ServiceExists`]), and publication follows the owner's
+    /// state — a `Starting` generation publishes atomically at commit, an
+    /// `Active`/root owner publishes immediately. Disposal of the owning
+    /// scope (generation teardown, [`Registration::dispose`] or app
+    /// shutdown) retires the binding. Dropping the returned
+    /// [`Registration`] does not unpublish.
+    pub async fn provide<T>(&self, key: ServiceKey<T>, value: Arc<T>) -> Result<Registration, Error>
+    where
+        T: Send + Sync + 'static,
+    {
+        let admission = self
+            .submit_provide(key.name(), key.type_id(), value, None)
+            .await?;
+        Ok(self.registration_from(admission))
+    }
+
+    /// Publishes a managed service: `start` runs on a supervised worker
+    /// and the binding becomes visible only after it succeeds; `stop`
+    /// runs as the binding's cleanup at teardown (docs/02-api.md §5,
+    /// V25).
+    ///
+    /// A failed or refused start leaves **no slot occupied** and fails
+    /// the owning generation; a start still in flight keeps the service
+    /// invisible (consumers stay `Pending`).
+    pub async fn provide_managed<T, SF, SFut, CF, CFut>(
+        &self,
+        key: ServiceKey<T>,
+        value: Arc<T>,
+        start: SF,
+        stop: CF,
+    ) -> Result<Registration, Error>
+    where
+        T: Send + Sync + 'static,
+        SF: FnOnce() -> SFut + Send + 'static,
+        SFut: Future<Output = Result<(), PluginError>> + Send + 'static,
+        CF: FnOnce() -> CFut + Send + 'static,
+        CFut: Future<Output = Result<(), CleanupError>> + Send + 'static,
+    {
+        let managed = (
+            Box::new(move || {
+                Box::pin(start())
+                    as std::pin::Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send>>
+            }) as crate::services::ManagedStartFn,
+            crate::effect::Cleanup::new(stop),
+        );
+        let admission = self
+            .submit_provide(key.name(), key.type_id(), value, Some(managed))
+            .await?;
+        Ok(self.registration_from(admission))
+    }
+
+    async fn submit_provide<T>(
+        &self,
+        name: &str,
+        type_id: std::any::TypeId,
+        value: Arc<T>,
+        managed: Option<(crate::services::ManagedStartFn, crate::effect::Cleanup)>,
+    ) -> Result<crate::effect::EffectAdmission, Error>
+    where
+        T: Send + Sync + 'static,
+    {
+        let inner = self.app.upgrade().ok_or(Error::HostClosed)?;
+        let request = crate::coordinator::command::ProvideRequest {
+            name: name.to_owned(),
+            type_id,
+            value: value as crate::plugin::AnyConfig,
+            managed,
+        };
+        let scopes = self.scopes.clone();
+        inner
+            .submit(|reply| Command::Provide {
+                scope: self.scope,
+                scopes,
+                request,
+                reply,
+            })
+            .await?
+    }
+
+    /// Acquires a typed lease on the service named by `key`
+    /// (docs/02-api.md §5).
+    ///
+    /// Allowed for dependencies the fiber's definition declared through
+    /// [`require`](crate::Plugin::require) and for bindings this scope
+    /// provides itself; anything else is
+    /// [`Error::UndeclaredDependency`]. The lease pins the exact binding
+    /// of this generation's dependency snapshot: a provider replacement
+    /// reloads the fiber instead of being followed silently.
+    pub async fn get<T>(&self, key: ServiceKey<T>) -> Result<ServiceLease<T>, Error>
+    where
+        T: Send + Sync + 'static,
+    {
+        let inner = self.app.upgrade().ok_or(Error::HostClosed)?;
+        let scopes = self.scopes.clone();
+        let name = key.name().to_owned();
+        let payload = inner
+            .submit(|reply| Command::ServiceGet {
+                scope: self.scope,
+                scopes,
+                name: name.clone(),
+                type_id: key.type_id(),
+                reply,
+            })
+            .await??;
+        Ok(ServiceLease::new(payload.binding, payload.cell))
+    }
+
+    /// Live-registry lookup by name with **no dependency tracking**
+    /// (docs/02-api.md §5): the returned handle observes the registry as
+    /// it is right now, does not add a dependency, does not trigger
+    /// reloads and is refused once the binding retires. For management
+    /// and diagnostics, or callers explicitly accepting dynamic behavior.
+    pub async fn lookup_dynamic(&self, name: impl Into<String>) -> Result<DynamicLease, Error> {
+        let inner = self.app.upgrade().ok_or(Error::HostClosed)?;
+        let scopes = self.scopes.clone();
+        let payload = inner
+            .submit(|reply| Command::LookupDynamic {
+                scopes,
+                name: name.into(),
+                reply,
+            })
+            .await??;
+        Ok(DynamicLease::new(
+            payload.binding,
+            payload.cell,
+            payload.type_id,
+        ))
+    }
+
+    /// Replaces the value of the binding `key` resolves to; only the
+    /// binding's owner may set (docs/04 §1.2).
+    ///
+    /// `set` bumps the value revision only: outstanding leases observe
+    /// the new value on their next
+    /// [`snapshot`](ServiceLease::snapshot), consumers are **not**
+    /// reloaded, and the dependency epoch is untouched. Setting another
+    /// provider's binding fails with [`Error::InvalidOwner`]; a context
+    /// of a replaced generation fails with [`Error::StaleGeneration`].
+    pub async fn set<T>(&self, key: ServiceKey<T>, value: Arc<T>) -> Result<(), Error>
+    where
+        T: Send + Sync + 'static,
+    {
+        let inner = self.app.upgrade().ok_or(Error::HostClosed)?;
+        let scopes = self.scopes.clone();
+        inner
+            .submit(|reply| Command::ServiceSet {
+                scope: self.scope,
+                scopes,
+                name: key.name().to_owned(),
+                type_id: key.type_id(),
+                value: value as crate::plugin::AnyConfig,
+                reply,
+            })
+            .await?
+    }
+
+    /// Flips the explicit availability of the binding `key` resolves to;
+    /// provider-side only (docs/04 §2).
+    ///
+    /// `false` makes the binding invisible immediately and invalidates
+    /// every consumer pinned to the old availability generation — their
+    /// gates close at admission of this command. `true` bumps the
+    /// availability generation again, so an in-flight `Starting` ticket
+    /// from before the flip can never publish (V26).
+    pub async fn set_available<T>(&self, key: ServiceKey<T>, available: bool) -> Result<(), Error>
+    where
+        T: Send + Sync + 'static,
+    {
+        let inner = self.app.upgrade().ok_or(Error::HostClosed)?;
+        let scopes = self.scopes.clone();
+        inner
+            .submit(|reply| Command::SetAvailability {
+                scope: self.scope,
+                scopes,
+                name: key.name().to_owned(),
+                available,
+                reply,
+            })
+            .await?
+    }
+
     fn registration_from(&self, admission: crate::effect::EffectAdmission) -> Registration {
         Registration {
             app: self.app.clone(),
@@ -328,9 +546,11 @@ impl Context {
         request: crate::coordinator::RegisterRequest,
     ) -> Result<crate::effect::EffectAdmission, Error> {
         let inner = self.app.upgrade().ok_or(Error::HostClosed)?;
+        let scopes = self.scopes.clone();
         inner
             .submit(|reply| Command::Register {
                 scope: self.scope,
+                scopes,
                 request,
                 label: label.into(),
                 reply,
