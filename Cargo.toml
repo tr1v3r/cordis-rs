@@ -1,0 +1,25 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/cordis-core",
+    "crates/cordis-loader",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+# MSRV: 1.85 is the first stable release supporting edition 2024. The crates
+# in this workspace have no external dependencies yet, so nothing currently
+# requires a higher version. Keep this field, `clippy.toml` and the policy
+# comment in `rust-toolchain.toml` in sync; MSRV is enforced by a dedicated CI
+# job (docs/06-implementation-plan.md, P8 platform/MSRV matrix).
+rust-version = "1.85"
+license = "MIT"
+authors = ["tr1v3r <tr1v3r@outlook.com>"]
+repository = "https://github.com/tr1v3r/cordis-rs"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }

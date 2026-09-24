@@ -1,0 +1,5 @@
+# rustfmt baseline for cordis-rs.
+# Keep options minimal and stable-only; change formatting settings only in a
+# dedicated, repo-wide formatting commit.
+edition = "2024"
+newline_style = "Unix"

@@ -1,0 +1,12 @@
+# Rust build artifacts
+/target
+
+# DeepSeek Harness AgentTeams runtime state (team.json, inboxes)
+/.agent-teams/
+
+# macOS
+.DS_Store
+
+# Test and coverage artifacts
+*.profraw
+/coverage

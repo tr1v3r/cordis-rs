@@ -1,0 +1,17 @@
+[package]
+name = "cordis-loader"
+description = "Loader and reconcile layer of cordis-rs (scaffold placeholder)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+# The loader reconciles configuration into cordis-core fibers; no other
+# dependency is pulled in at scaffold stage.
+cordis-core = { path = "../cordis-core" }
+
+[lints]
+workspace = true

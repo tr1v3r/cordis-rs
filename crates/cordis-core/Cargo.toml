@@ -1,0 +1,17 @@
+[package]
+name = "cordis-core"
+description = "Kernel of cordis-rs: coordinator, effect scopes, service bindings and events."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+# Intentionally empty: cordis-core must build with no default dependencies —
+# in particular no serde, wasmtime or notify (see AGENTS.md boundaries).
+# Optional extensions go behind explicit feature flags in later phases.
+[dependencies]
+
+[lints]
+workspace = true

@@ -1,0 +1,4 @@
+# Clippy configuration for cordis-rs.
+# `msrv` must match `rust-version` in the root Cargo.toml (workspace.package)
+# and the toolchain policy recorded in rust-toolchain.toml.
+msrv = "1.85"
