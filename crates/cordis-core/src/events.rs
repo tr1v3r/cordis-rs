@@ -25,6 +25,87 @@
 //! until the owning generation commits (or immediate for Active/root
 //! owners), unsubscribed at teardown, and admitted per-dispatch so a
 //! listener disposed after the snapshot never runs (V33).
+//!
+//! ## Minimal usage
+//!
+//! ```
+//! use cordis_core::{App, EventKey, ListenerConfig, WaterfallKey, define};
+//! use std::sync::{Arc, Mutex};
+//!
+//! struct Cfg;
+//! struct Ping {
+//!     seq: u32,
+//! }
+//! struct Greet {
+//!     name: String,
+//! }
+//!
+//! # fn main() {
+//! let rt = tokio::runtime::Builder::new_current_thread()
+//!     .enable_all()
+//!     .build()
+//!     .expect("runtime builds");
+//! rt.block_on(async {
+//!     let app = App::builder().build().expect("app builds");
+//!     let root = app.context();
+//!     let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+//!
+//!     let plugin = {
+//!         let log = Arc::clone(&log);
+//!         define("bus", move |ctx, _cfg: Arc<Cfg>| {
+//!             let log = Arc::clone(&log);
+//!             let ping = EventKey::<Ping>::new("ping");
+//!             let greet = WaterfallKey::<Greet, String>::new("greet");
+//!             async move {
+//!                 let emit_log = Arc::clone(&log);
+//!                 ctx.on_emit(
+//!                     ping,
+//!                     move |event: &Ping| {
+//!                         emit_log.lock().unwrap().push(format!("ping {}", event.seq));
+//!                         Ok(())
+//!                     },
+//!                     ListenerConfig::default(),
+//!                 )
+//!                 .await?;
+//!                 ctx.on_waterfall(
+//!                     greet,
+//!                     |mut event: Greet, next| async move {
+//!                         // Middleware may modify the payload on the way
+//!                         // down and wrap the result on the way up.
+//!                         event.name.push('!');
+//!                         let inner = next.run(event).await?;
+//!                         Ok(format!("hello {inner}"))
+//!                     },
+//!                     ListenerConfig::default(),
+//!                 )
+//!                 .await?;
+//!                 Ok(())
+//!             }
+//!         })
+//!     };
+//!
+//!     let receipt = root.load(&plugin, Cfg).await.expect("load admitted");
+//!     receipt.operation.wait().await.expect("active");
+//!
+//!     let report = root
+//!         .emit(EventKey::<Ping>::new("ping"), Ping { seq: 1 })
+//!         .await
+//!         .expect("emit dispatch");
+//!     assert!(report.is_clean());
+//!     assert_eq!(*log.lock().unwrap(), vec!["ping 1".to_owned()]);
+//!
+//!     let greeting = root
+//!         .waterfall(
+//!             WaterfallKey::<Greet, String>::new("greet"),
+//!             Greet { name: "cordis".into() },
+//!             |event| async move { Ok(event.name) },
+//!         )
+//!         .await
+//!         .expect("waterfall dispatch");
+//!     assert_eq!(greeting, "hello cordis!");
+//! });
+//! # }
+//! ```
 
 use std::any::Any;
 use std::future::Future;

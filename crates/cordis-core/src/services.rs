@@ -16,6 +16,58 @@
 //! - a [`ServiceLease`] pins one binding: snapshots observe `set` updates
 //!   and are refused with [`Error::ServiceRetired`] once the binding is
 //!   retired — but arcs already taken out are never revoked in place.
+//!
+//! ## Minimal usage
+//!
+//! Providers publish through their generation context; consumers declare
+//! dependencies with [`Plugin::require`](crate::Plugin::require) and
+//! lease them with [`Context::get`](crate::Context::get). A host-side
+//! [`Context::lookup_dynamic`](crate::Context::lookup_dynamic) observes
+//! the live registry for diagnostics without adding a dependency.
+//!
+//! ```
+//! use cordis_core::{App, ServiceKey, define};
+//! use std::sync::Arc;
+//!
+//! struct Db {
+//!     url: String,
+//! }
+//! struct Cfg;
+//!
+//! # fn main() {
+//! let rt = tokio::runtime::Builder::new_current_thread()
+//!     .enable_all()
+//!     .build()
+//!     .expect("runtime builds");
+//! rt.block_on(async {
+//!     let app = App::builder().build().expect("app builds");
+//!     let root = app.context();
+//!     let key = ServiceKey::<Db>::new("db");
+//!
+//!     // The provider publishes one binding from its generation context;
+//!     // disposal of that generation retires the binding.
+//!     let provider = define("db", move |ctx, _cfg: Arc<Cfg>| {
+//!         let key = key.clone();
+//!         async move {
+//!             ctx.provide(key, Arc::new(Db { url: "postgres://a".into() }))
+//!                 .await?;
+//!             Ok(())
+//!         }
+//!     });
+//!
+//!     let receipt = root.load(&provider, Cfg).await.expect("load admitted");
+//!     receipt.operation.wait().await.expect("provider active");
+//!
+//!     // A management view observes the binding without depending on it.
+//!     let lease = root.lookup_dynamic("db").await.expect("binding visible");
+//!     let value = lease.snapshot_as::<Db>().expect("typed snapshot");
+//!     assert_eq!(value.url, "postgres://a");
+//!
+//!     // Wrong expected types are refused by name, never auto-coerced.
+//!     assert!(lease.snapshot_as::<String>().is_err());
+//! });
+//! # }
+//! ```
 
 use std::any::{Any, TypeId};
 use std::collections::HashMap;

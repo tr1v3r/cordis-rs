@@ -40,3 +40,18 @@ workspace = true
 
 [features]
 tracing = ["dep:tracing"]
+
+# Runnable examples live in the workspace-level `examples/` directory
+# (README links them there); each is started with
+# `cargo run --example <name> -p cordis-core`.
+[[example]]
+name = "fibers"
+path = "../../examples/fibers.rs"
+
+[[example]]
+name = "services"
+path = "../../examples/services.rs"
+
+[[example]]
+name = "events"
+path = "../../examples/events.rs"

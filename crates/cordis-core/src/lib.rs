@@ -10,8 +10,10 @@
 //!
 //! ## Implemented so far
 //!
-//! This crate is under construction in the phases of
-//! `docs/06-implementation-plan.md`. In place are:
+//! The kernel MVP of `docs/06-implementation-plan.md` (P0–P5) is
+//! implemented and covered by the acceptance tests under `tests/`;
+//! configuration assembly (P6–P7) lives in the sibling `cordis-loader`
+//! crate. In place here:
 //!
 //! - the **identity and error layer (P1)**: id newtypes, the framework
 //!   error taxonomy, the [`App`]/[`Context`] skeleton with explicit
@@ -43,7 +45,6 @@
 //!   consumers pinned to the old stamp synchronously; namespace
 //!   chains with `fork`/`isolate`/`isolate_shared` where isolated
 //!   views never fall back to outer namespaces.
-//!
 //! - the **event system (P5)**: typed `EventKey`/`QueryKey`/
 //!   `WaterfallKey` with per-name mode/type identity fixed at first
 //!   registration; emit/bail/serial/parallel/waterfall dispatch with
@@ -55,7 +56,12 @@
 //!   reentrancy depth; a lossy structured diagnostics broadcast and an
 //!   optional `tracing` feature (off by default).
 //!
-//! With P0–P5 in place the kernel MVP of docs/06 is complete.
+//! ## Examples
+//!
+//! Runnable end-to-end examples live in the workspace-level `examples/`
+//! directory: `fibers.rs` (minimal plugin lifecycle), `services.rs`
+//! (dependency-driven reload) and `events.rs` (the typed event bus),
+//! each started with `cargo run --example <name> -p cordis-core`.
 //!
 //! ## Boundaries
 //!
@@ -93,8 +99,9 @@
 //!     let root = app.context();
 //!
 //!     let plugin = define("metrics", |_ctx, cfg: std::sync::Arc<MetricsConfig>| async move {
-//!         // Registers services, events and cleanup through the context of
-//!         // this generation once the lifecycle exists (P3+).
+//!         // This body runs on a supervised activation worker; register
+//!         // services, listeners, tasks and cleanups through the context
+//!         // of this generation here (see the crate examples).
 //!         assert!(!cfg.endpoint.is_empty());
 //!         Ok(())
 //!     });

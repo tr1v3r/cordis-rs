@@ -292,8 +292,8 @@ impl Context {
     /// closes the scope's admission gate synchronously on every exit
     /// path, so a registration arriving after the body returned is
     /// rejected with [`Error::InactiveScope`] (V13). A returned
-    /// [`Cleanup`] always enters the ledger, even if the generation went
-    /// stale meanwhile, and runs exactly once (V14).
+    /// [`Cleanup`](crate::Cleanup) always enters the ledger, even if the
+    /// generation went stale meanwhile, and runs exactly once (V14).
     pub async fn effect<F, Fut>(
         &self,
         label: impl Into<String>,
@@ -1319,10 +1319,10 @@ impl<C> FiberHandle<C> {
     /// Submits a new desired configuration; the latest submission wins.
     ///
     /// The returned operation resolves to
-    /// [`Active`](OperationOutcome::Active) when the new revision commits,
-    /// [`Failed`](OperationOutcome::Failed) if it fails, or
-    /// [`Superseded`](OperationOutcome::Superseded) when an even newer
-    /// request replaces it before it commits.
+    /// [`Active`](crate::OperationOutcome::Active) when the new revision
+    /// commits, [`Failed`](crate::OperationOutcome::Failed) if it fails,
+    /// or [`Superseded`](crate::OperationOutcome::Superseded) when an
+    /// even newer request replaces it before it commits.
     pub async fn update(&self, config: C) -> Result<crate::Operation, Error>
     where
         C: Send + Sync + 'static,

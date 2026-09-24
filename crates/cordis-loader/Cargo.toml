@@ -21,3 +21,9 @@ workspace = true
 
 [dev-dependencies]
 serde_json = "1"
+
+# Runnable example living in the workspace-level `examples/` directory;
+# started with `cargo run --example loader -p cordis-loader`.
+[[example]]
+name = "loader"
+path = "../../examples/loader.rs"
