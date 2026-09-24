@@ -44,7 +44,18 @@
 //!   chains with `fork`/`isolate`/`isolate_shared` where isolated
 //!   views never fall back to outer namespaces.
 //!
-//! Events (P5) attach to these seams.
+//! - the **event system (P5)**: typed `EventKey`/`QueryKey`/
+//!   `WaterfallKey` with per-name mode/type identity fixed at first
+//!   registration; emit/bail/serial/parallel/waterfall dispatch with
+//!   typed control flow and a move-only `Next`; listeners as effects
+//!   (staged until commit, unsubscribed at teardown); per-dispatch
+//!   admission claims with atomic `once` semantics; in-flight dispatches
+//!   drained by teardown instead of vanishing; scoped dispatch over the
+//!   same namespace chains as services with `global` bypass; bounded
+//!   reentrancy depth; a lossy structured diagnostics broadcast and an
+//!   optional `tracing` feature (off by default).
+//!
+//! With P0–P5 in place the kernel MVP of docs/06 is complete.
 //!
 //! ## Boundaries
 //!
@@ -128,6 +139,7 @@ mod context;
 mod coordinator;
 mod effect;
 mod error;
+mod events;
 mod id;
 mod machine;
 mod plugin;
@@ -140,13 +152,19 @@ pub use coordinator::KernelStats;
 pub use coordinator::operation::Operation;
 pub use effect::{Cleanup, Registration};
 pub use error::{CleanupError, Error, PluginError};
+pub use events::{
+    DispatchFailure, DispatchReport, EventKey, ListenerConfig, Next, ParallelReport, QueryKey,
+    WaterfallKey,
+};
 pub use id::{
-    BindingId, DefinitionId, EffectId, FiberId, GenerationId, OperationId, RuntimeId, TaskId,
+    BindingId, DefinitionId, DispatchId, EffectId, FiberId, GenerationId, OperationId, RuntimeId,
+    TaskId,
 };
 pub use machine::{FiberState, FiberStatus, FiberView};
 pub use plugin::{Plugin, define};
 pub use report::{
-    CleanupFailure, CleanupReport, OperationOutcome, ShutdownOptions, ShutdownReport,
+    CleanupFailure, CleanupReport, DiagnosticEvent, OperationOutcome, ShutdownOptions,
+    ShutdownReport,
 };
 pub use services::{DynamicLease, ScopeId, ServiceKey, ServiceLease};
 

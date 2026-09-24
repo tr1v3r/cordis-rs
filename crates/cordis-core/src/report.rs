@@ -11,7 +11,8 @@
 
 use crate::error::CleanupError;
 use crate::error::Error;
-use crate::id::GenerationId;
+use crate::id::{BindingId, DefinitionId, DispatchId, EffectId, FiberId, GenerationId};
+use crate::machine::FiberState;
 
 /// Outcome of a completed lifecycle operation.
 ///
@@ -86,6 +87,79 @@ impl CleanupReport {
     pub fn is_clean(&self) -> bool {
         self.failures.is_empty() && self.quarantined == 0
     }
+}
+
+/// One structured record of the public diagnostics stream
+/// (docs/04 §3.4, docs/06 P5.5).
+///
+/// The stream is a lossy broadcast: it keeps no history, may report lag
+/// to slow receivers and is **not** an audit log. Records carry ids and
+/// kernel-generated labels only — never configuration payloads, event
+/// payloads or secrets. Dependency propagation itself never rides this
+/// stream; it is driven directly by the registries.
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub enum DiagnosticEvent {
+    /// A fiber was admitted.
+    FiberCreated {
+        /// The admitted fiber.
+        fiber: FiberId,
+        /// The definition it was loaded from.
+        definition: DefinitionId,
+    },
+    /// A fiber's lifecycle state changed.
+    StateChanged {
+        /// The fiber.
+        fiber: FiberId,
+        /// The new state.
+        state: FiberState,
+        /// The committed generation, present exactly while active.
+        generation: Option<GenerationId>,
+    },
+    /// A service binding became visible.
+    ServicePublished {
+        /// The service name.
+        service: String,
+        /// The namespace it was published in.
+        namespace: String,
+        /// The binding identity.
+        binding: BindingId,
+    },
+    /// A generation was released (superseded, failed or disposed).
+    GenerationRetired {
+        /// The fiber that owned the generation.
+        fiber: FiberId,
+        /// The released generation.
+        generation: GenerationId,
+    },
+    /// A listener joined the dispatch selection.
+    ListenerRegistered {
+        /// The listener's effect entry.
+        listener: EffectId,
+        /// The event name.
+        event: String,
+    },
+    /// A listener left the selection.
+    ListenerRetired {
+        /// The listener's effect entry.
+        listener: EffectId,
+        /// The event name.
+        event: String,
+    },
+    /// A dispatch was admitted and started.
+    DispatchStarted {
+        /// The dispatch identity.
+        dispatch: DispatchId,
+        /// The event name.
+        event: String,
+    },
+    /// A dispatch settled.
+    DispatchFinished {
+        /// The dispatch identity.
+        dispatch: DispatchId,
+        /// The event name.
+        event: String,
+    },
 }
 
 /// Options for [`App::shutdown`](crate::App::shutdown).

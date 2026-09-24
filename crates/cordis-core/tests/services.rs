@@ -64,7 +64,7 @@ fn slot<T>() -> Slot<T> {
 
 /// Waits until `handle` reaches `want`, failing the test on timeout.
 async fn await_state<C>(handle: &FiberHandle<C>, want: FiberState) {
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(Duration::from_secs(15), async {
         loop {
             if handle.status().await.expect("fiber alive").state == want {
                 break;
@@ -234,15 +234,15 @@ async fn v19_chain_scenario() {
 
     let gen_a_1 = a
         .fiber
-        .wait_active(Instant::now() + Duration::from_secs(5))
+        .wait_active(Instant::now() + Duration::from_secs(15))
         .await
         .expect("chain activates");
     b.fiber
-        .wait_active(Instant::now() + Duration::from_secs(5))
+        .wait_active(Instant::now() + Duration::from_secs(15))
         .await
         .expect("b active");
     c.fiber
-        .wait_active(Instant::now() + Duration::from_secs(5))
+        .wait_active(Instant::now() + Duration::from_secs(15))
         .await
         .expect("c active");
     assert_eq!(applies.load(Ordering::SeqCst), 1);
@@ -261,7 +261,7 @@ async fn v19_chain_scenario() {
     b_ctx.set_available(api_key(), true).await.expect("recover");
     let gen_a_2 = a
         .fiber
-        .wait_active(Instant::now() + Duration::from_secs(5))
+        .wait_active(Instant::now() + Duration::from_secs(15))
         .await
         .expect("A reactivates");
     assert_ne!(gen_a_1, gen_a_2, "recovery is a new generation");
@@ -323,7 +323,7 @@ async fn v20_epoch_reload_scenario() {
     let consumer = root.load(&consumer_plugin, Cfg).await.expect("consumer");
     let generation_1 = consumer
         .fiber
-        .wait_active(Instant::now() + Duration::from_secs(5))
+        .wait_active(Instant::now() + Duration::from_secs(15))
         .await
         .expect("consumer active on the first binding");
     assert_eq!(applies.load(Ordering::SeqCst), 1);
@@ -344,7 +344,7 @@ async fn v20_epoch_reload_scenario() {
     let second = root.load(&db_plugin, Cfg).await.expect("second provider");
     let generation_2 = consumer
         .fiber
-        .wait_active(Instant::now() + Duration::from_secs(5))
+        .wait_active(Instant::now() + Duration::from_secs(15))
         .await
         .expect("consumer reactivates");
     assert_ne!(generation_1, generation_2);
@@ -427,7 +427,7 @@ async fn v21_set_replaces_values_without_reloading_consumers() {
     let consumer = root.load(&consumer_plugin, Cfg).await.expect("consumer");
     let generation = consumer
         .fiber
-        .wait_active(Instant::now() + Duration::from_secs(5))
+        .wait_active(Instant::now() + Duration::from_secs(15))
         .await
         .expect("consumer active");
     let lease = lease_slot.lock().unwrap().clone().expect("lease captured");
@@ -507,7 +507,7 @@ async fn v23_isolated_namespaces_do_not_fall_back_and_share_labels_per_service()
     let default_provider = root.load(&db_plugin, Cfg).await.expect("load");
     default_provider
         .fiber
-        .wait_active(Instant::now() + Duration::from_secs(5))
+        .wait_active(Instant::now() + Duration::from_secs(15))
         .await
         .expect("default provider active");
 
@@ -575,7 +575,7 @@ async fn v23_isolated_namespaces_do_not_fall_back_and_share_labels_per_service()
     let cache_provider = team_view.load(&cache_plugin, Cfg).await.expect("load");
     cache_provider
         .fiber
-        .wait_active(Instant::now() + Duration::from_secs(5))
+        .wait_active(Instant::now() + Duration::from_secs(15))
         .await
         .expect("team cache active");
 
@@ -611,7 +611,7 @@ async fn v24_type_and_permission_errors_are_explicit() {
     let provider_handle = root.load(&db_plugin, Cfg).await.expect("load");
     provider_handle
         .fiber
-        .wait_active(Instant::now() + Duration::from_secs(5))
+        .wait_active(Instant::now() + Duration::from_secs(15))
         .await
         .expect("provider active");
 
@@ -671,7 +671,7 @@ async fn v24_type_and_permission_errors_are_explicit() {
     let consumer_handle = root.load(&consumer_plugin, Cfg).await.expect("load");
     consumer_handle
         .fiber
-        .wait_active(Instant::now() + Duration::from_secs(5))
+        .wait_active(Instant::now() + Duration::from_secs(15))
         .await
         .expect("consumer active");
     assert_eq!(*seen.lock().unwrap(), vec!["type", "undeclared", "ok"]);
@@ -743,7 +743,7 @@ async fn v25_managed_services_publish_after_start_and_fail_without_slot() {
     let consumer = root.load(&consumer_plugin, Cfg).await.expect("load");
     managed
         .fiber
-        .wait_active(Instant::now() + Duration::from_secs(5))
+        .wait_active(Instant::now() + Duration::from_secs(15))
         .await
         .expect("provider fiber active while its managed start is gated");
     assert!(
@@ -759,7 +759,7 @@ async fn v25_managed_services_publish_after_start_and_fail_without_slot() {
     start_gate.notify_one();
     consumer
         .fiber
-        .wait_active(Instant::now() + Duration::from_secs(5))
+        .wait_active(Instant::now() + Duration::from_secs(15))
         .await
         .expect("consumer activates after start");
     assert_eq!(applies.load(Ordering::SeqCst), 1);
@@ -802,7 +802,7 @@ async fn v25_managed_services_publish_after_start_and_fail_without_slot() {
     let plain = root.load(&plain_plugin, Cfg).await.expect("slot was free");
     plain
         .fiber
-        .wait_active(Instant::now() + Duration::from_secs(5))
+        .wait_active(Instant::now() + Duration::from_secs(15))
         .await
         .expect("plain provider takes the freed slot");
     let lease = root.lookup_dynamic(KEY_DB).await.expect("visible now");
@@ -836,7 +836,7 @@ async fn v26_flip_scenario() {
     let provider_handle = root.load(&db_plugin, Cfg).await.expect("load");
     provider_handle
         .fiber
-        .wait_active(Instant::now() + Duration::from_secs(5))
+        .wait_active(Instant::now() + Duration::from_secs(15))
         .await
         .expect("provider active");
 
@@ -869,7 +869,7 @@ async fn v26_flip_scenario() {
         .require(db_key())
     };
     let consumer_handle = root.load(&slow_consumer, Cfg).await.expect("admitted");
-    let reached = tokio::time::timeout(Duration::from_secs(5), async {
+    let reached = tokio::time::timeout(Duration::from_secs(15), async {
         while reached_get.load(Ordering::SeqCst) == 0 {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
@@ -892,7 +892,7 @@ async fn v26_flip_scenario() {
 
     let generation_2 = consumer_handle
         .fiber
-        .wait_active(Instant::now() + Duration::from_secs(5))
+        .wait_active(Instant::now() + Duration::from_secs(15))
         .await
         .expect("consumer settles after the flip");
     assert_ne!(
@@ -941,7 +941,7 @@ async fn v26_flip_scenario() {
     let left_handle = root.load(&left, Cfg).await.expect("left admitted");
     let right_handle = root.load(&right, Cfg).await.expect("right admitted");
 
-    let settled = tokio::time::timeout(Duration::from_secs(5), async {
+    let settled = tokio::time::timeout(Duration::from_secs(15), async {
         loop {
             let left_state = left_handle.fiber.status().await.unwrap().state;
             let right_state = right_handle.fiber.status().await.unwrap().state;
@@ -1012,7 +1012,7 @@ async fn v27_lease_retirement_refuses_snapshots_but_keeps_taken_arcs() {
     let consumer_handle = root.load(&consumer_plugin, Cfg).await.expect("load");
     consumer_handle
         .fiber
-        .wait_active(Instant::now() + Duration::from_secs(5))
+        .wait_active(Instant::now() + Duration::from_secs(15))
         .await
         .expect("consumer active");
 

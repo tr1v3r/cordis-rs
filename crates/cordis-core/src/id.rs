@@ -29,6 +29,8 @@ static NEXT_OPERATION_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_EFFECT_ID: AtomicU64 = AtomicU64::new(1);
 /// Global allocator for supervised task identities (task effects).
 static NEXT_TASK_ID: AtomicU64 = AtomicU64::new(1);
+/// Global allocator for event dispatch identities.
+static NEXT_DISPATCH_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Declares an id newtype over a `u64` counter value.
 ///
@@ -174,6 +176,21 @@ impl TaskId {
     /// Allocates the next process-global supervised-task identity.
     pub(crate) fn alloc_global() -> Self {
         Self(NEXT_TASK_ID.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
+// Identity of one admitted event dispatch (P5).
+id_newtype!(
+    /// Identity of one admitted event dispatch. Allocated by the
+    /// coordinator when it snapshots and claims listeners; used by the
+    /// in-flight drain bookkeeping and diagnostics.
+    DispatchId
+);
+
+impl DispatchId {
+    /// Allocates the next process-global dispatch identity.
+    pub(crate) fn alloc_global() -> Self {
+        Self(NEXT_DISPATCH_ID.fetch_add(1, Ordering::Relaxed))
     }
 }
 

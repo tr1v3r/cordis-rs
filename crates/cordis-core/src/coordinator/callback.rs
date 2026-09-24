@@ -21,6 +21,26 @@ task_local! {
     pub(crate) static CALLBACK_ORIGIN: ();
 }
 
+// Task-local event-dispatch nesting depth (docs/04 §3.3). Dispatch
+// workers run their handlers one level deeper than the submitting task;
+// context dispatch methods read the current depth and refuse past the
+// limit, so a handler emitting its own event recursively converges on
+// `ReentrantDispatchLimit` instead of exhausting the stack or waiting on
+// itself (V35). Like `CALLBACK_ORIGIN`, a bare `tokio::spawn` inside a
+// handler escapes the tracking — such tasks are user responsibility.
+task_local! {
+    pub(crate) static DISPATCH_DEPTH: std::cell::Cell<u32>;
+}
+
+/// Maximum event-dispatch nesting depth (docs/04 §3.3).
+pub(crate) const MAX_DISPATCH_DEPTH: u32 = 32;
+
+/// The dispatch nesting depth of the current task (0 outside dispatch
+/// workers).
+pub(crate) fn dispatch_depth() -> u32 {
+    DISPATCH_DEPTH.try_with(|cell| cell.get()).unwrap_or(0)
+}
+
 /// Returns `true` when the current task is polling user code on behalf of
 /// the framework.
 ///

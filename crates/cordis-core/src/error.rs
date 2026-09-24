@@ -83,6 +83,33 @@ pub enum Error {
         /// The retired binding.
         binding: crate::id::BindingId,
     },
+    /// No listener is registered under the dispatched event name.
+    EventUnknown {
+        /// Name of the event.
+        event: String,
+    },
+    /// A registration or dispatch contradicts the identity (mode or
+    /// payload/response type) already fixed for the event name
+    /// (docs/04 §3.1: conflicts are rejected at registration time).
+    EventConflict {
+        /// Name of the event.
+        event: String,
+        /// Why the identity check failed.
+        reason: String,
+    },
+    /// A nested dispatch exceeded the maximum reentrancy depth
+    /// (docs/04 §3.3). The dispatch is refused instead of growing the
+    /// stack or deadlocking on workers.
+    ReentrantDispatchLimit,
+    /// A dispatched handler failed: the dispatch short-circuited with the
+    /// handler's error (bail/serial/waterfall) or the dispatch worker
+    /// panicked. `listener` names the failing effect when known.
+    HandlerFailed {
+        /// The listener whose handler failed, when identifiable.
+        listener: Option<crate::id::EffectId>,
+        /// The error returned by the handler, or the rendered panic.
+        source: PluginError,
+    },
     /// A registration is being operated on by a scope that does not own it.
     InvalidOwner,
     /// Waiting for an operation from inside that operation's own lifecycle
@@ -174,6 +201,19 @@ impl fmt::Display for Error {
                 f,
                 "service binding {binding:?} is retired; leases no longer serve snapshots"
             ),
+            Error::EventUnknown { event } => {
+                write!(f, "no listener is registered for event {event:?}")
+            }
+            Error::EventConflict { event, reason } => {
+                write!(f, "event {event:?} identity conflict: {reason}")
+            }
+            Error::ReentrantDispatchLimit => {
+                write!(f, "nested dispatch exceeded the maximum reentrancy depth")
+            }
+            Error::HandlerFailed { listener, .. } => match listener {
+                Some(listener) => write!(f, "a dispatched handler failed (listener {listener:?})"),
+                None => write!(f, "a dispatched handler failed"),
+            },
             Error::InvalidOwner => write!(f, "the registration is not owned by this scope"),
             Error::WouldDeadlock => write!(
                 f,
@@ -207,6 +247,7 @@ impl StdError for Error {
             Error::ActivationFailed { source } => Some(source),
             Error::TaskFailed { source } => Some(source.as_ref()),
             Error::CleanupFailed { source } => Some(source),
+            Error::HandlerFailed { source, .. } => Some(source),
             _ => None,
         }
     }

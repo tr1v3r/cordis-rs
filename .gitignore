@@ -10,3 +10,4 @@
 # Test and coverage artifacts
 *.profraw
 /coverage
+/.cargo-home/

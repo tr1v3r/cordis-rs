@@ -17,10 +17,15 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::context::Context;
-use crate::coordinator::callback::CALLBACK_ORIGIN;
+use crate::coordinator::callback::{CALLBACK_ORIGIN, DISPATCH_DEPTH};
 use crate::coordinator::command::InternalMsg;
 use crate::effect::{Cleanup, CloseGateOnDrop, Gate, SetupFn, TaskFn};
-use crate::id::{EffectId, FiberId, GenerationId, TaskId};
+use crate::error::{Error, PluginError};
+use crate::events::{
+    DispatchFailure, DispatchOutcome, DispatchPayload, DispatchReport, EventMode, ListenerHandler,
+    NextErased, WaterfallFinal,
+};
+use crate::id::{DispatchId, EffectId, FiberId, GenerationId, TaskId};
 use crate::plugin::{AnyConfig, ErasedPlugin};
 
 /// Terminal result of one activation worker, as joined by the watcher.
@@ -285,6 +290,315 @@ pub(crate) fn spawn_activation(
     WorkerTicket { abort }
 }
 
+/// Upper bound of handler concurrency inside one parallel dispatch
+/// (docs/04 §3.1: concurrency is capped, not unbounded).
+pub(crate) const PARALLELISM_CAP: usize = 8;
+
+/// One admitted dispatch execution: the claimed handlers in dispatch
+/// order, the payload and (for waterfalls) the caller-supplied final.
+pub(crate) struct DispatchJob {
+    pub(crate) dispatch: DispatchId,
+    pub(crate) mode: EventMode,
+    pub(crate) handlers: Vec<(EffectId, std::sync::Arc<ListenerHandler>)>,
+    pub(crate) payload: DispatchPayload,
+    pub(crate) final_: Option<WaterfallFinal>,
+    /// The submitting task's nesting depth: the worker runs handlers one
+    /// level deeper (docs/04 §3.3), so nested dispatches from handlers
+    /// see an accurate depth.
+    pub(crate) caller_depth: u32,
+}
+
+/// Runs one dispatch to completion inside a worker task.
+///
+/// Sync handlers run inline under a panic boundary; async handler futures
+/// run as child tasks (joins isolate panics) — sequentially for serial,
+/// under [`PARALLELISM_CAP`] for parallel, one middleware step at a time
+/// for waterfall. The whole job runs inside the callback scope (lifecycle
+/// waits are refused with `WouldDeadlock`) and at the caller's nesting
+/// depth + 1, which is how reentrancy limits are enforced (docs/04 §3.3).
+pub(crate) async fn run_dispatch_job(job: DispatchJob) -> Result<DispatchOutcome, Error> {
+    let depth = job.caller_depth + 1;
+    DISPATCH_DEPTH
+        .scope(std::cell::Cell::new(depth), execute_dispatch(job))
+        .await
+}
+
+async fn execute_dispatch(job: DispatchJob) -> Result<DispatchOutcome, Error> {
+    match job.mode {
+        EventMode::Emit => Ok(DispatchOutcome::Report(run_emit(&job))),
+        // The async runners take the job by value: their futures must be
+        // `Send`, and an owned job is `Send` without requiring `Sync`.
+        EventMode::Bail => run_bail(job).await,
+        EventMode::Serial => run_serial(job).await,
+        EventMode::Parallel => run_parallel(job).await,
+        // The waterfall owns its payload and final: it moves them through
+        // the chain.
+        EventMode::Waterfall => run_waterfall(job).await,
+    }
+}
+
+fn panic_to_plugin(panic: Box<dyn std::any::Any + Send>) -> PluginError {
+    PluginError::from(format!("handler panicked: {}", panic_payload(panic)))
+}
+
+fn run_emit(job: &DispatchJob) -> DispatchReport {
+    let DispatchPayload::Owned(payload) = &job.payload else {
+        return DispatchReport {
+            delivered: 0,
+            failures: vec![DispatchFailure {
+                listener: EffectId::alloc_global(),
+                error: PluginError::from("emit dispatch carried a shared payload"),
+            }],
+        };
+    };
+    let mut report = DispatchReport::default();
+    for (listener, handler) in &job.handlers {
+        let ListenerHandler::Emit(handle) = &**handler else {
+            report.failures.push(DispatchFailure {
+                listener: *listener,
+                error: PluginError::from("emit dispatch claimed a non-emit handler"),
+            });
+            continue;
+        };
+        match catch_unwind(AssertUnwindSafe(|| handle(payload.as_ref()))) {
+            Ok(Ok(())) => report.delivered += 1,
+            Ok(Err(error)) => report.failures.push(DispatchFailure {
+                listener: *listener,
+                error,
+            }),
+            Err(panic) => report.failures.push(DispatchFailure {
+                listener: *listener,
+                error: panic_to_plugin(panic),
+            }),
+        }
+    }
+    report
+}
+
+async fn run_bail(job: DispatchJob) -> Result<DispatchOutcome, Error> {
+    let DispatchPayload::Owned(payload) = &job.payload else {
+        return Err(Error::EventConflict {
+            event: String::new(),
+            reason: "bail dispatch carried a shared payload".to_owned(),
+        });
+    };
+    for (listener, handler) in &job.handlers {
+        let ListenerHandler::Bail(handle) = &**handler else {
+            return Err(Error::HandlerFailed {
+                listener: Some(*listener),
+                source: PluginError::from("bail dispatch claimed a non-bail handler"),
+            });
+        };
+        match catch_unwind(AssertUnwindSafe(|| handle(payload.as_ref()))) {
+            Ok(Ok(std::ops::ControlFlow::Continue(()))) => continue,
+            Ok(Ok(std::ops::ControlFlow::Break(value))) => {
+                return Ok(DispatchOutcome::Flow(Some(value)));
+            }
+            Ok(Err(error)) => {
+                return Err(Error::HandlerFailed {
+                    listener: Some(*listener),
+                    source: error,
+                });
+            }
+            Err(panic) => {
+                return Err(Error::HandlerFailed {
+                    listener: Some(*listener),
+                    source: panic_to_plugin(panic),
+                });
+            }
+        }
+    }
+    Ok(DispatchOutcome::Flow(None))
+}
+
+/// Wraps a handler future so its child task inherits the worker's
+/// task-locals: the callback-origin marker (lifecycle waits inside
+/// handlers stay refused) and the dispatch nesting depth (nested
+/// dispatches keep an accurate reentrancy count, docs/04 §3.3).
+///
+/// Task-locals do not cross `tokio::spawn` boundaries on their own —
+/// without this, a handler could wait on its own lifecycle (deadlock)
+/// or recurse past the depth limit unnoticed.
+pub(crate) fn inherit_worker_locals<F: std::future::Future>(
+    fut: F,
+) -> impl std::future::Future<Output = F::Output> {
+    let depth = DISPATCH_DEPTH.try_with(|cell| cell.get()).unwrap_or(0);
+    async move {
+        CALLBACK_ORIGIN
+            .scope((), DISPATCH_DEPTH.scope(std::cell::Cell::new(depth), fut))
+            .await
+    }
+}
+
+/// Awaits one boxed handler future on its own child task so a panicking
+/// handler surfaces as a join error instead of unwinding the worker.
+async fn join_handler(
+    fut: std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<crate::events::ControlFlowErased, PluginError>>
+                + Send,
+        >,
+    >,
+) -> Result<crate::events::ControlFlowErased, PluginError> {
+    match tokio::spawn(inherit_worker_locals(fut)).await {
+        Ok(result) => result,
+        Err(join_error) if join_error.is_panic() => Err(panic_to_plugin(join_error.into_panic())),
+        Err(_) => Err(PluginError::from("handler task was cancelled")),
+    }
+}
+
+/// Awaits one boxed value-producing handler future (parallel /
+/// waterfall) with the same panic isolation.
+async fn join_value_handler(
+    fut: std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<crate::events::EventResponse, PluginError>>
+                + Send,
+        >,
+    >,
+) -> Result<crate::events::EventResponse, PluginError> {
+    match tokio::spawn(inherit_worker_locals(fut)).await {
+        Ok(result) => result,
+        Err(join_error) if join_error.is_panic() => Err(panic_to_plugin(join_error.into_panic())),
+        Err(_) => Err(PluginError::from("handler task was cancelled")),
+    }
+}
+
+async fn run_serial(job: DispatchJob) -> Result<DispatchOutcome, Error> {
+    let DispatchPayload::Shared(payload) = &job.payload else {
+        return Err(Error::EventConflict {
+            event: String::new(),
+            reason: "serial dispatch carried an owned payload".to_owned(),
+        });
+    };
+    for (listener, handler) in &job.handlers {
+        let ListenerHandler::Serial(handle) = &**handler else {
+            return Err(Error::HandlerFailed {
+                listener: Some(*listener),
+                source: PluginError::from("serial dispatch claimed a non-serial handler"),
+            });
+        };
+        let fut = handle(std::sync::Arc::clone(payload));
+        match join_handler(fut).await {
+            Ok(std::ops::ControlFlow::Continue(())) => continue,
+            Ok(std::ops::ControlFlow::Break(value)) => {
+                return Ok(DispatchOutcome::Flow(Some(value)));
+            }
+            Err(source) => {
+                return Err(Error::HandlerFailed {
+                    listener: Some(*listener),
+                    source,
+                });
+            }
+        }
+    }
+    Ok(DispatchOutcome::Flow(None))
+}
+
+async fn run_parallel(job: DispatchJob) -> Result<DispatchOutcome, Error> {
+    let DispatchPayload::Shared(payload) = &job.payload else {
+        return Err(Error::EventConflict {
+            event: String::new(),
+            reason: "parallel dispatch carried an owned payload".to_owned(),
+        });
+    };
+    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(PARALLELISM_CAP));
+    let mut tasks = Vec::with_capacity(job.handlers.len());
+    for (listener, handler) in &job.handlers {
+        let ListenerHandler::Parallel(handle) = &**handler else {
+            return Err(Error::HandlerFailed {
+                listener: Some(*listener),
+                source: PluginError::from("parallel dispatch claimed a non-parallel handler"),
+            });
+        };
+        let fut = handle(std::sync::Arc::clone(payload));
+        let permit = std::sync::Arc::clone(&semaphore)
+            .acquire_owned()
+            .await
+            .expect("semaphore never closed");
+        // Bounded fan: the permit is held for the handler's lifetime; all
+        // started work is awaited before the dispatch completes.
+        tasks.push((
+            *listener,
+            tokio::spawn(async move {
+                let _permit = permit;
+                inherit_worker_locals(fut).await
+            }),
+        ));
+    }
+    let mut results = Vec::with_capacity(tasks.len());
+    for (listener, task) in tasks {
+        match task.await {
+            Ok(Ok(value)) => results.push(Ok(value)),
+            Ok(Err(error)) => results.push(Err(error)),
+            Err(join_error) if join_error.is_panic() => {
+                results.push(Err(panic_to_plugin(join_error.into_panic())))
+            }
+            Err(_) => results.push(Err(PluginError::from(
+                "parallel handler task was cancelled",
+            ))),
+        }
+        let _ = listener;
+    }
+    Ok(DispatchOutcome::Parallel(results))
+}
+
+async fn run_waterfall(job: DispatchJob) -> Result<DispatchOutcome, Error> {
+    let DispatchPayload::Owned(payload) = job.payload else {
+        return Err(Error::EventConflict {
+            event: String::new(),
+            reason: "waterfall dispatch carried a shared payload".to_owned(),
+        });
+    };
+    let Some(final_) = job.final_ else {
+        return Err(Error::EventConflict {
+            event: String::new(),
+            reason: "waterfall dispatch without a final".to_owned(),
+        });
+    };
+    let chain: std::sync::Arc<[std::sync::Arc<ListenerHandler>]> = job
+        .handlers
+        .iter()
+        .map(|(_, h)| std::sync::Arc::clone(h))
+        .collect();
+    let head = NextErased::new(chain, final_);
+    let response = join_value_handler(Box::pin(head.run(payload)))
+        .await
+        .map_err(|source| Error::HandlerFailed {
+            listener: None,
+            source,
+        })?;
+    Ok(DispatchOutcome::Waterfall(response))
+}
+
+/// Spawns the dispatch worker for `job` plus its watcher.
+///
+/// The worker runs inside the callback scope (lifecycle waits inside
+/// handlers are refused) and at the submitting task's nesting depth + 1.
+pub(crate) fn spawn_dispatch(
+    job: DispatchJob,
+    internal: mpsc::UnboundedSender<InternalMsg>,
+) -> WorkerTicket {
+    let dispatch = job.dispatch;
+    let worker: JoinHandle<Result<DispatchOutcome, Error>> =
+        tokio::spawn(async move { CALLBACK_ORIGIN.scope((), run_dispatch_job(job)).await });
+    let abort = worker.abort_handle();
+    tokio::spawn(async move {
+        let result = match worker.await {
+            Ok(report) => report,
+            Err(join_error) if join_error.is_panic() => Err(Error::WorkerPanicked {
+                context: "the dispatch worker".to_owned(),
+                message: panic_payload(join_error.into_panic()),
+            }),
+            Err(_) => Err(Error::DeadlineExceeded {
+                reason: "dispatch worker aborted before completion".to_owned(),
+            }),
+        };
+        let _ = internal.send(InternalMsg::DispatchFinished { dispatch, result });
+    });
+    WorkerTicket { abort }
+}
+
 /// Renders a panic payload to a String without assuming its type.
 pub(crate) fn panic_payload(payload: Box<dyn std::any::Any + Send>) -> String {
     if let Some(text) = payload.downcast_ref::<&str>() {
@@ -299,6 +613,50 @@ pub(crate) fn panic_payload(payload: Box<dyn std::any::Any + Send>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::coordinator::callback::dispatch_depth;
+
+    #[tokio::test]
+    async fn dispatch_worker_depth_mechanics() {
+        use crate::events::{ControlFlowErased, DispatchPayload, EventMode, ListenerHandler};
+        use std::sync::atomic::AtomicU32;
+
+        // A serial handler observes the nesting depth inside its child
+        // task: the worker runs at caller_depth + 1 and the spawned
+        // handler inherits it (docs/04 §3.3).
+        let seen = Arc::new(AtomicU32::new(u32::MAX));
+        let writer = Arc::clone(&seen);
+        let handler =
+            ListenerHandler::Serial(Box::new(move |_payload: crate::events::SharedPayload| {
+                let writer = Arc::clone(&writer);
+                Box::pin(async move {
+                    writer.store(dispatch_depth(), std::sync::atomic::Ordering::SeqCst);
+                    Ok(ControlFlowErased::Continue(()))
+                })
+                    as std::pin::Pin<
+                        Box<
+                            dyn std::future::Future<Output = Result<ControlFlowErased, PluginError>>
+                                + Send,
+                        >,
+                    >
+            }));
+        let job = DispatchJob {
+            dispatch: DispatchId::alloc_global(),
+            mode: EventMode::Serial,
+            handlers: vec![(EffectId::alloc_global(), Arc::new(handler))],
+            payload: DispatchPayload::Shared(Arc::new(7u32)),
+            final_: None,
+            caller_depth: 5,
+        };
+        run_dispatch_job(job)
+            .await
+            .expect("serial dispatch with no break completes");
+        assert_eq!(
+            seen.load(std::sync::atomic::Ordering::SeqCst),
+            6,
+            "handler inherits caller_depth + 1"
+        );
+    }
+
     use crate::app::App;
     use crate::define;
     use std::sync::atomic::{AtomicUsize, Ordering};

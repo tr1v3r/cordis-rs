@@ -350,9 +350,10 @@ pub(crate) struct FiberRecord {
     /// The namespace chain of the loading view; generation contexts
     /// inherit it so providers and consumers resolve identical slots.
     pub(crate) scopes: crate::services::ScopeChain,
-    /// The generation whose staged service bindings were published
-    /// (docs/04 §1.3: publication happens once per generation commit).
-    pub(crate) published_bindings: Option<GenerationId>,
+    /// The generation whose staged resources (service bindings, event
+    /// listeners) were published (docs/04 §1.3, §3.2: publication happens
+    /// once per generation commit).
+    pub(crate) published_generation: Option<GenerationId>,
     /// Watch stream of the fiber's state view. The actor keeps the
     /// original receiver alive: a watch channel whose receivers are all
     /// gone is closed, and later sends would silently stop updating.
@@ -401,7 +402,7 @@ impl FiberRecord {
             owner_effect: None,
             required: Vec::new(),
             scopes: crate::services::ScopeChain::root(),
-            published_bindings: None,
+            published_generation: None,
             watch,
             watch_rx,
         }
@@ -452,7 +453,7 @@ impl FiberRecord {
             owner_effect: None,
             required: Vec::new(),
             scopes: crate::services::ScopeChain::root(),
-            published_bindings: None,
+            published_generation: None,
             watch,
             watch_rx,
         }

@@ -9,7 +9,8 @@ use crate::context::Context;
 use crate::coordinator::{Command, CommandSender, KernelStats, Limits, RetireLane};
 use crate::error::Error;
 use crate::id::{FiberId, GenerationId};
-use crate::report::{ShutdownOptions, ShutdownReport};
+use crate::report::{DiagnosticEvent, ShutdownOptions, ShutdownReport};
+use tokio::sync::broadcast;
 
 /// The host application: the owner of all plugin runtime state.
 ///
@@ -115,11 +116,13 @@ impl AppBuilder {
             });
         }
         let (external_tx, external_rx) = mpsc::channel::<Command>(self.limits.mailbox_capacity);
+        let (diagnostics_tx, _) = broadcast::channel::<DiagnosticEvent>(1024);
         let inner = Arc::new(AppInner {
             name: self.name,
             tx: external_tx,
             closed: AtomicBool::new(false),
             report: Mutex::new(None),
+            diagnostics: diagnostics_tx.clone(),
         });
 
         let root = FiberId::alloc_global();
@@ -131,6 +134,7 @@ impl AppBuilder {
             root,
             root_generation,
             self.limits,
+            diagnostics_tx,
         );
         tokio::spawn(coordinator.run());
         Ok(App { inner })
@@ -175,6 +179,21 @@ impl App {
     /// Fails with [`Error::HostClosed`] once the app is closed.
     pub async fn stats(&self) -> Result<KernelStats, Error> {
         self.inner.submit(|reply| Command::Stats { reply }).await
+    }
+
+    /// Subscribes to the structured diagnostics stream
+    /// (docs/04 §3.4, docs/06 P5.5).
+    ///
+    /// The stream is a lossy broadcast of [`DiagnosticEvent`]s — fiber
+    /// and generation transitions, service publications, listener
+    /// lifecycle and dispatch start/finish. It keeps no history: a slow
+    /// receiver observes [`BroadcastError::Lagged`] and continues with
+    /// the latest records; it is not a persistent audit log. User
+    /// callbacks never execute inside the stream.
+    ///
+    /// [`BroadcastError::Lagged`]: tokio::sync::broadcast::error::RecvError::Lagged
+    pub fn diagnostics(&self) -> broadcast::Receiver<DiagnosticEvent> {
+        self.inner.diagnostics.subscribe()
     }
 
     /// Explicitly shuts the app down and returns the completion report.
@@ -245,6 +264,7 @@ pub(crate) struct AppInner {
     tx: CommandSender,
     closed: AtomicBool,
     report: Mutex<Option<ShutdownReport>>,
+    diagnostics: broadcast::Sender<DiagnosticEvent>,
 }
 
 impl AppInner {

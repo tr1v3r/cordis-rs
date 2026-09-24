@@ -15,7 +15,12 @@ use super::supervisor::{CleanupResult, SetupResult, TaskResult, WorkerResult};
 use crate::coordinator::operation::Operation;
 use crate::effect::{Cleanup, CleanupFuture, EffectAdmission, SetupFn, TaskFn};
 use crate::error::Error;
-use crate::id::{BindingId, DefinitionId, EffectId, FiberId, GenerationId, RuntimeId, TaskId};
+use crate::events::{
+    DispatchOutcome, DispatchPayload, EventMode, ListenerConfig, ListenerHandler, WaterfallFinal,
+};
+use crate::id::{
+    BindingId, DefinitionId, DispatchId, EffectId, FiberId, GenerationId, RuntimeId, TaskId,
+};
 use crate::machine::FiberView;
 use crate::plugin::AnyConfig;
 use crate::report::{ShutdownOptions, ShutdownReport};
@@ -174,6 +179,55 @@ pub(crate) enum Command {
         name: String,
         reply: oneshot::Sender<Result<DynamicLeasePayload, Error>>,
     },
+    /// Register a listener under a scope (docs/04 §3.2). The listener is
+    /// an effect entry: staged while the owning generation is Starting,
+    /// selected once committed (or immediately for Active/root owners).
+    Subscribe {
+        scope: ScopeRef,
+        scopes: ScopeChain,
+        request: SubscribeRequest,
+        reply: oneshot::Sender<Result<EffectAdmission, Error>>,
+    },
+    /// Admit an event dispatch: snapshot listeners, claim admissions
+    /// (including once) and spawn the supervised dispatch worker
+    /// (docs/04 §3.2). The reply confirms admission; the outcome arrives
+    /// on the request's completion channel.
+    Dispatch {
+        scope: ScopeRef,
+        scopes: ScopeChain,
+        request: DispatchRequest,
+        reply: oneshot::Sender<Result<DispatchId, Error>>,
+    },
+}
+
+/// The erased payload of a listener registration.
+pub(crate) struct SubscribeRequest {
+    pub(crate) name: String,
+    pub(crate) mode: EventMode,
+    pub(crate) payload_type: TypeId,
+    pub(crate) response_type: Option<TypeId>,
+    pub(crate) config: ListenerConfig,
+    pub(crate) handler: std::sync::Arc<ListenerHandler>,
+}
+
+/// The erased payload of a dispatch.
+pub(crate) struct DispatchRequest {
+    pub(crate) name: String,
+    pub(crate) mode: EventMode,
+    pub(crate) payload_type: TypeId,
+    pub(crate) response_type: Option<TypeId>,
+    pub(crate) payload: DispatchPayload,
+    /// Scoped dispatch filters by the dispatching view's namespace for
+    /// the event name; global listeners bypass the filter (docs/04 §3.3).
+    pub(crate) scoped: bool,
+    /// The dispatch-supplied final of a waterfall (None otherwise).
+    pub(crate) final_: Option<WaterfallFinal>,
+    /// Reentrancy depth of the submitting task (docs/04 §3.3).
+    pub(crate) caller_depth: u32,
+    /// Completion channel: resolved by the actor when the dispatch worker
+    /// reports; dropped callers cancel only the observation, never the
+    /// supervised dispatch (docs/03-runtime.md §4.3).
+    pub(crate) completion: oneshot::Sender<Result<DispatchOutcome, Error>>,
 }
 
 /// The erased payload of a `provide` request.
@@ -250,6 +304,12 @@ pub(crate) enum InternalMsg {
         binding: BindingId,
         result: TaskResult,
     },
+    /// A dispatch worker finished (normally or panicked); once-listener
+    /// entries retire and quiesce waits are satisfied (V32/V33).
+    DispatchFinished {
+        dispatch: DispatchId,
+        result: Result<DispatchOutcome, Error>,
+    },
 }
 
 /// Immutable kernel-wide diagnostics snapshot.
@@ -279,6 +339,10 @@ pub struct KernelStats {
     pub retirement_completed: u64,
     /// Service bindings currently staged or published (P4).
     pub service_bindings_live: usize,
+    /// Event listeners currently registered (P5).
+    pub listeners_live: usize,
+    /// Admitted event dispatches currently in flight (P5).
+    pub dispatches_in_flight: usize,
 }
 
 /// Handle to the coordinator's external mailbox.

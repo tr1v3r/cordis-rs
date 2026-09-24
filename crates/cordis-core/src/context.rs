@@ -15,6 +15,10 @@ use crate::coordinator::callback::in_callback;
 use crate::coordinator::{Command, ScopeRef};
 use crate::effect::Registration;
 use crate::error::{CleanupError, Error, PluginError};
+use crate::events::{
+    DispatchOutcome, DispatchPayload, DispatchReport, EventKey, EventMode, ListenerConfig, Next,
+    ParallelReport, QueryKey, WaterfallKey,
+};
 use crate::id::{DefinitionId, EffectId, FiberId, GenerationId, RuntimeId};
 use crate::machine::{FiberState, FiberStatus, FiberView};
 use crate::plugin::Plugin;
@@ -78,6 +82,19 @@ impl fmt::Debug for Context {
             None => f.debug_struct("Context").field("app", &"<closed>").finish(),
         }
     }
+}
+
+/// The erased shape of one dispatch submission (crate-internal): keeps
+/// `submit_dispatch` below clippy's argument budget and gives the
+/// dispatch mode wrappers one uniform construction site.
+struct DispatchSpec {
+    name: String,
+    mode: EventMode,
+    payload_type: std::any::TypeId,
+    response_type: Option<std::any::TypeId>,
+    payload: DispatchPayload,
+    scoped: bool,
+    final_: Option<crate::events::WaterfallFinal>,
 }
 
 impl Context {
@@ -528,6 +545,601 @@ impl Context {
                 reply,
             })
             .await?
+    }
+
+    // ---- Event bus API (docs/04 §3, docs/02-api.md §6) ----
+
+    /// Registers an **emit** listener: a sync handler run in dispatch
+    /// order; errors are collected into a [`DispatchReport`] instead of
+    /// short-circuiting the rest (docs/04 §3.1).
+    ///
+    /// The listener is an effect of this scope: staged while the owning
+    /// generation is `Starting`, selected once committed, unsubscribed at
+    /// teardown. Dropping the returned [`Registration`] does not
+    /// unsubscribe.
+    pub async fn on_emit<E, F>(
+        &self,
+        key: EventKey<E>,
+        handler: F,
+        config: ListenerConfig,
+    ) -> Result<Registration, Error>
+    where
+        E: Send + Sync + 'static,
+        F: Fn(&E) -> Result<(), PluginError> + Send + Sync + 'static,
+    {
+        let handler = Box::new(move |payload: &(dyn std::any::Any + Send + Sync)| {
+            let event = payload
+                .downcast_ref::<E>()
+                .expect("actor verified the payload type");
+            handler(event)
+        });
+        let request = crate::coordinator::command::SubscribeRequest {
+            name: key.name().to_owned(),
+            mode: EventMode::Emit,
+            payload_type: std::any::TypeId::of::<E>(),
+            response_type: None,
+            config,
+            handler: std::sync::Arc::new(crate::events::ListenerHandler::Emit(handler)),
+        };
+        let admission = self.submit_subscribe(request).await?;
+        Ok(self.registration_from(admission))
+    }
+
+    /// Registers a **bail** listener: a sync handler whose typed
+    /// [`ControlFlow`](std::ops::ControlFlow) continues or breaks the
+    /// dispatch; `Err`/panic stops it with an error (V29).
+    pub async fn on_bail<E, R, F>(
+        &self,
+        key: QueryKey<E, R>,
+        handler: F,
+        config: ListenerConfig,
+    ) -> Result<Registration, Error>
+    where
+        E: Send + Sync + 'static,
+        R: Send + 'static,
+        F: Fn(&E) -> Result<std::ops::ControlFlow<R>, PluginError> + Send + Sync + 'static,
+    {
+        let handler = Box::new(move |payload: &(dyn std::any::Any + Send + Sync)| {
+            let event = payload
+                .downcast_ref::<E>()
+                .expect("actor verified the payload type");
+            Ok(match handler(event)? {
+                std::ops::ControlFlow::Continue(()) => std::ops::ControlFlow::Continue(()),
+                std::ops::ControlFlow::Break(value) => {
+                    std::ops::ControlFlow::Break(Box::new(value) as crate::events::EventResponse)
+                }
+            })
+        });
+        let request = crate::coordinator::command::SubscribeRequest {
+            name: key.name().to_owned(),
+            mode: EventMode::Bail,
+            payload_type: std::any::TypeId::of::<E>(),
+            response_type: Some(std::any::TypeId::of::<R>()),
+            config,
+            handler: std::sync::Arc::new(crate::events::ListenerHandler::Bail(handler)),
+        };
+        let admission = self.submit_subscribe(request).await?;
+        Ok(self.registration_from(admission))
+    }
+
+    /// Registers a **serial** listener: an async handler awaited in
+    /// dispatch order with the same typed control flow as bail (V29).
+    pub async fn on_serial<E, R, F, Fut>(
+        &self,
+        key: QueryKey<E, R>,
+        handler: F,
+        config: ListenerConfig,
+    ) -> Result<Registration, Error>
+    where
+        E: Send + Sync + 'static,
+        R: Send + 'static,
+        F: Fn(std::sync::Arc<E>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<std::ops::ControlFlow<R>, PluginError>> + Send + 'static,
+    {
+        // The user handler is shared across invocations: wrap it in an
+        // `Arc` so every call clones the handle instead of moving the
+        // closure out of this `Fn` wrapper.
+        let handler = std::sync::Arc::new(handler);
+        let handler = Box::new(
+            move |payload: crate::events::SharedPayload| -> std::pin::Pin<
+                Box<
+                    dyn Future<Output = Result<crate::events::ControlFlowErased, PluginError>>
+                        + Send,
+                >,
+            > {
+                let handler = std::sync::Arc::clone(&handler);
+                let event = payload
+                    .downcast::<E>()
+                    .expect("actor verified the payload type");
+                Box::pin(async move {
+                    Ok(match handler(event).await? {
+                        std::ops::ControlFlow::Continue(()) => std::ops::ControlFlow::Continue(()),
+                        std::ops::ControlFlow::Break(value) => std::ops::ControlFlow::Break(
+                            Box::new(value) as crate::events::EventResponse,
+                        ),
+                    })
+                })
+            },
+        );
+        let request = crate::coordinator::command::SubscribeRequest {
+            name: key.name().to_owned(),
+            mode: EventMode::Serial,
+            payload_type: std::any::TypeId::of::<E>(),
+            response_type: Some(std::any::TypeId::of::<R>()),
+            config,
+            handler: std::sync::Arc::new(crate::events::ListenerHandler::Serial(handler)),
+        };
+        let admission = self.submit_subscribe(request).await?;
+        Ok(self.registration_from(admission))
+    }
+
+    /// Registers a **parallel** listener: an async handler fanned out
+    /// under bounded concurrency; results are aggregated in dispatch
+    /// order (V30).
+    pub async fn on_parallel<E, R, F, Fut>(
+        &self,
+        key: QueryKey<E, R>,
+        handler: F,
+        config: ListenerConfig,
+    ) -> Result<Registration, Error>
+    where
+        E: Send + Sync + 'static,
+        R: Send + 'static,
+        F: Fn(std::sync::Arc<E>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<R, PluginError>> + Send + 'static,
+    {
+        let handler = std::sync::Arc::new(handler);
+        let handler = Box::new(
+            move |payload: crate::events::SharedPayload| -> std::pin::Pin<
+                Box<dyn Future<Output = Result<crate::events::EventResponse, PluginError>> + Send>,
+            > {
+                let handler = std::sync::Arc::clone(&handler);
+                let event = payload
+                    .downcast::<E>()
+                    .expect("actor verified the payload type");
+                Box::pin(async move {
+                    Ok(Box::new(handler(event).await?) as crate::events::EventResponse)
+                })
+            },
+        );
+        let request = crate::coordinator::command::SubscribeRequest {
+            name: key.name().to_owned(),
+            mode: EventMode::Parallel,
+            payload_type: std::any::TypeId::of::<E>(),
+            response_type: Some(std::any::TypeId::of::<R>()),
+            config,
+            handler: std::sync::Arc::new(crate::events::ListenerHandler::Parallel(handler)),
+        };
+        let admission = self.submit_subscribe(request).await?;
+        Ok(self.registration_from(admission))
+    }
+
+    /// Registers a **waterfall** middleware: it may modify the payload,
+    /// forward through the move-only [`Next`], wrap the inner result or
+    /// short-circuit by not forwarding (V31).
+    pub async fn on_waterfall<E, R, F, Fut>(
+        &self,
+        key: WaterfallKey<E, R>,
+        middleware: F,
+        config: ListenerConfig,
+    ) -> Result<Registration, Error>
+    where
+        E: Send + Sync + 'static,
+        R: Send + 'static,
+        F: Fn(E, Next<E, R>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<R, PluginError>> + Send + 'static,
+    {
+        let middleware = std::sync::Arc::new(middleware);
+        let middleware = Box::new(
+            move |payload: crate::events::EventPayload,
+                  next: crate::events::NextErased|
+                  -> std::pin::Pin<
+                Box<dyn Future<Output = Result<crate::events::EventResponse, PluginError>> + Send>,
+            > {
+                let middleware = std::sync::Arc::clone(&middleware);
+                let event = *payload
+                    .downcast::<E>()
+                    .expect("actor verified the payload type");
+                let typed_next = Next::<E, R>::new(next);
+                Box::pin(async move {
+                    Ok(Box::new(middleware(event, typed_next).await?)
+                        as crate::events::EventResponse)
+                })
+            },
+        );
+        let request = crate::coordinator::command::SubscribeRequest {
+            name: key.name().to_owned(),
+            mode: EventMode::Waterfall,
+            payload_type: std::any::TypeId::of::<E>(),
+            response_type: Some(std::any::TypeId::of::<R>()),
+            config,
+            handler: std::sync::Arc::new(crate::events::ListenerHandler::Waterfall(middleware)),
+        };
+        let admission = self.submit_subscribe(request).await?;
+        Ok(self.registration_from(admission))
+    }
+
+    async fn submit_subscribe(
+        &self,
+        request: crate::coordinator::command::SubscribeRequest,
+    ) -> Result<crate::effect::EffectAdmission, Error> {
+        let inner = self.app.upgrade().ok_or(Error::HostClosed)?;
+        let scopes = self.scopes.clone();
+        inner
+            .submit(|reply| Command::Subscribe {
+                scope: self.scope,
+                scopes,
+                request,
+                reply,
+            })
+            .await?
+    }
+
+    /// Dispatches an **emit** event and awaits the aggregate report
+    /// (V28).
+    pub async fn emit<E>(&self, key: EventKey<E>, event: E) -> Result<DispatchReport, Error>
+    where
+        E: Send + Sync + 'static,
+    {
+        self.emit_scoped_with(key, event, false).await
+    }
+
+    /// Scoped variant of [`emit`](Self::emit): only listeners of the
+    /// dispatching view's namespace for the event name — plus global
+    /// listeners — are selected (V34).
+    pub async fn emit_scoped<E>(&self, key: EventKey<E>, event: E) -> Result<DispatchReport, Error>
+    where
+        E: Send + Sync + 'static,
+    {
+        self.emit_scoped_with(key, event, true).await
+    }
+
+    async fn emit_scoped_with<E>(
+        &self,
+        key: EventKey<E>,
+        event: E,
+        scoped: bool,
+    ) -> Result<DispatchReport, Error>
+    where
+        E: Send + Sync + 'static,
+    {
+        let outcome = self
+            .submit_dispatch(DispatchSpec {
+                name: key.name().to_owned(),
+                mode: EventMode::Emit,
+                payload_type: std::any::TypeId::of::<E>(),
+                response_type: None,
+                payload: DispatchPayload::Owned(Box::new(event)),
+                scoped,
+                final_: None,
+            })
+            .await?;
+        match outcome {
+            DispatchOutcome::Report(report) => Ok(report),
+            _ => Err(Error::EventConflict {
+                event: key.name().to_owned(),
+                reason: "emit dispatch returned a foreign outcome".to_owned(),
+            }),
+        }
+    }
+
+    /// Dispatches a **bail** query: handlers run in order until one
+    /// breaks (returning its value) or fails (V29).
+    pub async fn bail<E, R>(&self, key: QueryKey<E, R>, event: E) -> Result<Option<R>, Error>
+    where
+        E: Send + Sync + 'static,
+        R: Send + 'static,
+    {
+        self.bail_scoped_with(key, event, false).await
+    }
+
+    /// Scoped variant of [`bail`](Self::bail).
+    pub async fn bail_scoped<E, R>(&self, key: QueryKey<E, R>, event: E) -> Result<Option<R>, Error>
+    where
+        E: Send + Sync + 'static,
+        R: Send + 'static,
+    {
+        self.bail_scoped_with(key, event, true).await
+    }
+
+    async fn bail_scoped_with<E, R>(
+        &self,
+        key: QueryKey<E, R>,
+        event: E,
+        scoped: bool,
+    ) -> Result<Option<R>, Error>
+    where
+        E: Send + Sync + 'static,
+        R: Send + 'static,
+    {
+        let outcome = self
+            .submit_dispatch(DispatchSpec {
+                name: key.name().to_owned(),
+                mode: EventMode::Bail,
+                payload_type: std::any::TypeId::of::<E>(),
+                response_type: Some(std::any::TypeId::of::<R>()),
+                payload: DispatchPayload::Owned(Box::new(event)),
+                scoped,
+                final_: None,
+            })
+            .await?;
+        match outcome {
+            DispatchOutcome::Flow(None) => Ok(None),
+            DispatchOutcome::Flow(Some(value)) => match value.downcast::<R>() {
+                Ok(value) => Ok(Some(*value)),
+                Err(_) => Err(Error::EventConflict {
+                    event: key.name().to_owned(),
+                    reason: "bail dispatch returned a foreign response type".to_owned(),
+                }),
+            },
+            _ => Err(Error::EventConflict {
+                event: key.name().to_owned(),
+                reason: "bail dispatch returned a foreign outcome".to_owned(),
+            }),
+        }
+    }
+
+    /// Dispatches a **serial** query: async handlers awaited in order
+    /// with the same control flow as bail (V29).
+    pub async fn serial<E, R>(&self, key: QueryKey<E, R>, event: E) -> Result<Option<R>, Error>
+    where
+        E: Send + Sync + 'static,
+        R: Send + 'static,
+    {
+        self.serial_scoped_with(key, event, false).await
+    }
+
+    /// Scoped variant of [`serial`](Self::serial).
+    pub async fn serial_scoped<E, R>(
+        &self,
+        key: QueryKey<E, R>,
+        event: E,
+    ) -> Result<Option<R>, Error>
+    where
+        E: Send + Sync + 'static,
+        R: Send + 'static,
+    {
+        self.serial_scoped_with(key, event, true).await
+    }
+
+    async fn serial_scoped_with<E, R>(
+        &self,
+        key: QueryKey<E, R>,
+        event: E,
+        scoped: bool,
+    ) -> Result<Option<R>, Error>
+    where
+        E: Send + Sync + 'static,
+        R: Send + 'static,
+    {
+        let outcome = self
+            .submit_dispatch(DispatchSpec {
+                name: key.name().to_owned(),
+                mode: EventMode::Serial,
+                payload_type: std::any::TypeId::of::<E>(),
+                response_type: Some(std::any::TypeId::of::<R>()),
+                payload: DispatchPayload::Shared(std::sync::Arc::new(event)),
+                scoped,
+                final_: None,
+            })
+            .await?;
+        match outcome {
+            DispatchOutcome::Flow(None) => Ok(None),
+            DispatchOutcome::Flow(Some(value)) => match value.downcast::<R>() {
+                Ok(value) => Ok(Some(*value)),
+                Err(_) => Err(Error::EventConflict {
+                    event: key.name().to_owned(),
+                    reason: "serial dispatch returned a foreign response type".to_owned(),
+                }),
+            },
+            _ => Err(Error::EventConflict {
+                event: key.name().to_owned(),
+                reason: "serial dispatch returned a foreign outcome".to_owned(),
+            }),
+        }
+    }
+
+    /// Dispatches a **parallel** query: handlers fan out under bounded
+    /// concurrency and results are assembled in dispatch order (V30).
+    pub async fn parallel<E, R>(
+        &self,
+        key: QueryKey<E, R>,
+        event: E,
+    ) -> Result<ParallelReport<R>, Error>
+    where
+        E: Send + Sync + 'static,
+        R: Send + 'static,
+    {
+        self.parallel_scoped_with(key, event, false).await
+    }
+
+    /// Scoped variant of [`parallel`](Self::parallel).
+    pub async fn parallel_scoped<E, R>(
+        &self,
+        key: QueryKey<E, R>,
+        event: E,
+    ) -> Result<ParallelReport<R>, Error>
+    where
+        E: Send + Sync + 'static,
+        R: Send + 'static,
+    {
+        self.parallel_scoped_with(key, event, true).await
+    }
+
+    async fn parallel_scoped_with<E, R>(
+        &self,
+        key: QueryKey<E, R>,
+        event: E,
+        scoped: bool,
+    ) -> Result<ParallelReport<R>, Error>
+    where
+        E: Send + Sync + 'static,
+        R: Send + 'static,
+    {
+        let outcome = self
+            .submit_dispatch(DispatchSpec {
+                name: key.name().to_owned(),
+                mode: EventMode::Parallel,
+                payload_type: std::any::TypeId::of::<E>(),
+                response_type: Some(std::any::TypeId::of::<R>()),
+                payload: DispatchPayload::Shared(std::sync::Arc::new(event)),
+                scoped,
+                final_: None,
+            })
+            .await?;
+        match outcome {
+            DispatchOutcome::Parallel(results) => {
+                let typed = results
+                    .into_iter()
+                    .map(|entry| {
+                        entry.and_then(|value| match value.downcast::<R>() {
+                            Ok(value) => Ok(*value),
+                            Err(_) => Err(PluginError::from(
+                                "parallel dispatch returned a foreign response type",
+                            )),
+                        })
+                    })
+                    .collect();
+                Ok(ParallelReport { results: typed })
+            }
+            _ => Err(Error::EventConflict {
+                event: key.name().to_owned(),
+                reason: "parallel dispatch returned a foreign outcome".to_owned(),
+            }),
+        }
+    }
+
+    /// Dispatches a **waterfall**: the registered middlewares run around
+    /// the caller-supplied `final`, which produces the innermost value
+    /// and runs at most once (V31).
+    pub async fn waterfall<E, R, F, Fut>(
+        &self,
+        key: WaterfallKey<E, R>,
+        event: E,
+        final_: F,
+    ) -> Result<R, Error>
+    where
+        E: Send + Sync + 'static,
+        R: Send + 'static,
+        F: FnOnce(E) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<R, PluginError>> + Send + 'static,
+    {
+        self.waterfall_scoped_with(key, event, final_, false).await
+    }
+
+    /// Scoped variant of [`waterfall`](Self::waterfall).
+    pub async fn waterfall_scoped<E, R, F, Fut>(
+        &self,
+        key: WaterfallKey<E, R>,
+        event: E,
+        final_: F,
+    ) -> Result<R, Error>
+    where
+        E: Send + Sync + 'static,
+        R: Send + 'static,
+        F: FnOnce(E) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<R, PluginError>> + Send + 'static,
+    {
+        self.waterfall_scoped_with(key, event, final_, true).await
+    }
+
+    async fn waterfall_scoped_with<E, R, F, Fut>(
+        &self,
+        key: WaterfallKey<E, R>,
+        event: E,
+        final_: F,
+        scoped: bool,
+    ) -> Result<R, Error>
+    where
+        E: Send + Sync + 'static,
+        R: Send + 'static,
+        F: FnOnce(E) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<R, PluginError>> + Send + 'static,
+    {
+        let final_ = Box::new(
+            move |payload: crate::events::EventPayload| -> std::pin::Pin<
+                Box<dyn Future<Output = Result<crate::events::EventResponse, PluginError>> + Send>,
+            > {
+                let event = *payload
+                    .downcast::<E>()
+                    .expect("actor verified the payload type");
+                Box::pin(async move {
+                    Ok(Box::new(final_(event).await?) as crate::events::EventResponse)
+                })
+            },
+        );
+        let outcome = self
+            .submit_dispatch(DispatchSpec {
+                name: key.name().to_owned(),
+                mode: EventMode::Waterfall,
+                payload_type: std::any::TypeId::of::<E>(),
+                response_type: Some(std::any::TypeId::of::<R>()),
+                payload: DispatchPayload::Owned(Box::new(event)),
+                scoped,
+                final_: Some(final_),
+            })
+            .await?;
+        match outcome {
+            DispatchOutcome::Waterfall(value) => match value.downcast::<R>() {
+                Ok(value) => Ok(*value),
+                Err(_) => Err(Error::EventConflict {
+                    event: key.name().to_owned(),
+                    reason: "waterfall dispatch returned a foreign response type".to_owned(),
+                }),
+            },
+            _ => Err(Error::EventConflict {
+                event: key.name().to_owned(),
+                reason: "waterfall dispatch returned a foreign outcome".to_owned(),
+            }),
+        }
+    }
+
+    async fn submit_dispatch(&self, request: DispatchSpec) -> Result<DispatchOutcome, Error> {
+        let DispatchSpec {
+            name,
+            mode,
+            payload_type,
+            response_type,
+            payload,
+            scoped,
+            final_,
+        } = request;
+        // Reentrancy guard first (docs/04 §3.3): a handler dispatching
+        // its own event recursively converges on a refusal instead of a
+        // stack overflow or a worker self-wait.
+        let depth = crate::coordinator::callback::dispatch_depth();
+        if depth >= crate::coordinator::callback::MAX_DISPATCH_DEPTH {
+            return Err(Error::ReentrantDispatchLimit);
+        }
+        let inner = self.app.upgrade().ok_or(Error::HostClosed)?;
+        let (completion_tx, completion_rx) = oneshot::channel();
+        let scopes = self.scopes.clone();
+        let request = crate::coordinator::command::DispatchRequest {
+            name,
+            mode,
+            payload_type,
+            response_type,
+            payload,
+            scoped,
+            final_,
+            caller_depth: depth,
+            completion: completion_tx,
+        };
+        // Admission first: the reply confirms the dispatch was admitted
+        // (or refused); the outcome follows on the completion channel. A
+        // cancelled caller cancels only the observation.
+        inner
+            .submit(|reply| Command::Dispatch {
+                scope: self.scope,
+                scopes,
+                request,
+                reply,
+            })
+            .await??;
+        match completion_rx.await {
+            Ok(outcome) => outcome,
+            Err(_) => Err(Error::HostClosed),
+        }
     }
 
     fn registration_from(&self, admission: crate::effect::EffectAdmission) -> Registration {

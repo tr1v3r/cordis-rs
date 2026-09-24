@@ -9,6 +9,7 @@
 
 pub(crate) mod callback;
 pub(crate) mod command;
+pub(crate) mod events;
 pub(crate) mod operation;
 pub(crate) mod retire;
 pub(crate) mod services;
@@ -22,22 +23,28 @@ use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::app::AppInner;
 use crate::context::Context;
+use crate::coordinator::events::EventRegistry;
 use crate::coordinator::operation::Operation;
 use crate::coordinator::services::{
     DepFacts, ServiceRegistry, SlotKey, StartState, compute_dep_facts,
 };
 use crate::effect::{Cleanup, EffectAdmission, Gate};
 use crate::error::{CleanupError, Error};
+use crate::events::{DispatchOutcome, ListenerHandler};
 use crate::id::ROOT_DEFINITION_ID;
 use crate::id::{
-    BindingId, DefinitionId, EffectId, FiberId, GenerationId, OperationId, RuntimeId, TaskId,
+    BindingId, DefinitionId, DispatchId, EffectId, FiberId, GenerationId, OperationId, RuntimeId,
+    TaskId,
 };
 use crate::machine::{
     ConvergeCtx, FailureInfo, FiberRecord, FiberState, OpKind, Outcome, ParentScope, StepEffects,
 };
 use crate::plugin::{AnyConfig, ErasedPlugin};
-use crate::report::{CleanupFailure, CleanupReport, OperationOutcome, ShutdownReport};
+use crate::report::{
+    CleanupFailure, CleanupReport, DiagnosticEvent, OperationOutcome, ShutdownReport,
+};
 use crate::services::ScopeChain;
+use tokio::sync::broadcast;
 
 pub use command::KernelStats;
 pub(crate) use command::{Command, CommandSender, InternalMsg, RegisterRequest, ScopeRef};
@@ -93,6 +100,7 @@ enum WorkerKey {
     Cleanup(EffectId),
     Task(TaskId),
     ManagedStart(BindingId),
+    Dispatch(DispatchId),
 }
 
 /// Lifecycle state of one ledger entry (docs/03-runtime.md §6).
@@ -140,6 +148,12 @@ enum EntryKind {
         /// plain bindings and after the start settled).
         start_in_flight: bool,
     },
+    /// An event listener (`on_emit` / `on_bail` / `on_serial` /
+    /// `on_parallel` / `on_waterfall`). The handler lives in the event
+    /// registry keyed by this entry; teardown unsubscribes it and, while
+    /// dispatches that already admitted it are in flight, waits for them
+    /// (docs/04 §3.2, V33).
+    Listener,
 }
 
 /// One ledger entry: published before its worker starts (I05).
@@ -190,12 +204,16 @@ enum DrainKind {
     Subtree { root: EffectId },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum QuiesceWait {
     Setup(EffectId),
     Task(TaskId),
     ChildFiber(FiberId),
     ManagedStart(BindingId),
+    /// An admitted dispatch whose claimed listeners intersect the
+    /// draining subtree: it is *not* aborted — an admitted callback
+    /// counts as in-flight and the drain waits for it (V33).
+    Dispatch(DispatchId),
 }
 
 struct ShutdownState {
@@ -204,6 +222,16 @@ struct ShutdownState {
     /// Fibers that were live when shutdown started; the report counts
     /// only these.
     pending: HashSet<FiberId>,
+}
+
+/// One admitted dispatch in flight: its claimed listeners (for drain
+/// intersection), the once entries to retire afterwards, and the
+/// completion channel of the dispatching caller.
+struct DispatchRecord {
+    event: String,
+    claimed: Vec<EffectId>,
+    once_entries: Vec<EffectId>,
+    completion: oneshot::Sender<Result<DispatchOutcome, Error>>,
 }
 
 /// The coordinator actor.
@@ -227,6 +255,15 @@ pub(crate) struct Coordinator {
     /// The service registry (docs/04): slots, bindings and the reverse
     /// dependency index. Actor-confined like every other table.
     services: ServiceRegistry,
+    /// The event registry (docs/04 §3): fixed per-name identities plus
+    /// ordered, possibly staged listeners.
+    events: EventRegistry,
+    /// Admitted dispatches in flight (docs/04 §3.2).
+    dispatches: HashMap<DispatchId, DispatchRecord>,
+    /// Structured diagnostics stream (docs/04 §3.4): latest-wins watch
+    /// semantics are the per-fiber streams; this broadcast may lag and
+    /// drop, and is not an audit log.
+    diagnostics: broadcast::Sender<DiagnosticEvent>,
     limits: Limits,
     stale_discarded: u64,
     runtimes_dropped: usize,
@@ -244,6 +281,7 @@ impl Coordinator {
         root: FiberId,
         root_generation: GenerationId,
         limits: Limits,
+        diagnostics: broadcast::Sender<DiagnosticEvent>,
     ) -> Self {
         let (internal_tx, internal_rx) = mpsc::unbounded_channel();
         let mut fibers = HashMap::new();
@@ -266,6 +304,9 @@ impl Coordinator {
             drains: HashMap::new(),
             next_drain_id: 0,
             services: ServiceRegistry::new(),
+            events: EventRegistry::new(),
+            dispatches: HashMap::new(),
+            diagnostics,
             limits,
             stale_discarded: 0,
             runtimes_dropped: 0,
@@ -396,11 +437,49 @@ impl Coordinator {
         let facts = self.dep_facts_for(fiber);
         let ctx = self.ctx_for(fiber);
         let mut fx = StepEffects::default();
+        let generation_before = self
+            .fibers
+            .get(&fiber)
+            .and_then(|record| record.generation.as_ref().map(|g| g.id));
+        let mut view_changed = None;
         if let Some(record) = self.fibers.get_mut(&fiber) {
             record.converge(&mut fx, &ctx);
             let view = record.view();
             if *record.watch.borrow() != view {
                 let _ = record.watch.send(view);
+                view_changed = Some(view);
+            }
+        }
+        if let Some(view) = view_changed {
+            let _ = self.diagnostics.send(DiagnosticEvent::StateChanged {
+                fiber,
+                state: view.state,
+                generation: view.active_generation,
+            });
+            #[cfg(feature = "tracing")]
+            tracing::debug!(
+                fiber = fiber.as_u64(),
+                state = view.state.as_str(),
+                "fiber state changed"
+            );
+        }
+        if let Some(generation) = generation_before {
+            let retired = self.fibers.get(&fiber).is_none_or(|record| {
+                record
+                    .generation
+                    .as_ref()
+                    .is_none_or(|g| g.id != generation)
+            });
+            if retired {
+                let _ = self
+                    .diagnostics
+                    .send(DiagnosticEvent::GenerationRetired { fiber, generation });
+                #[cfg(feature = "tracing")]
+                tracing::debug!(
+                    fiber = fiber.as_u64(),
+                    generation = generation.as_u64(),
+                    "generation retired"
+                );
             }
         }
         // Pin the dependency vector of a freshly assigned generation: the
@@ -416,48 +495,76 @@ impl Coordinator {
             }
         }
         self.apply_effects(fiber, fx);
-        self.publish_generation_services(fiber);
+        self.publish_generation(fiber);
         self.start_pending_tasks(fiber);
         self.maybe_start_generation_drain(fiber);
     }
 
-    /// Publishes every staged binding of `fiber`'s committed generation
-    /// (docs/04 §1.3: the whole generation publishes atomically once,
-    /// after the identity and stamp re-verification inside the same
-    /// serial transition).
-    fn publish_generation_services(&mut self, fiber: FiberId) {
+    /// Publishes the generation's staged resources atomically once
+    /// (docs/04 §1.3, §3.2): service bindings become visible and staged
+    /// listeners join the dispatch selection — after the identity and
+    /// stamp re-verification inside the same serial transition.
+    fn publish_generation(&mut self, fiber: FiberId) {
         let Some(generation) = self.fibers.get(&fiber).and_then(|record| {
             (record.state == FiberState::Active)
                 .then_some(record.active_generation)
                 .flatten()
-                .filter(|g| record.published_bindings != Some(*g))
+                .filter(|g| record.published_generation != Some(*g))
         }) else {
             return;
         };
-        let bindings: Vec<BindingId> = self
+        let entries: Vec<EffectId> = self
             .fibers
             .get(&fiber)
             .map(|record| record.all_entries.clone())
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|id| self.effects.get(&id))
+            .unwrap_or_default();
+        let bindings: Vec<BindingId> = entries
+            .iter()
+            .filter_map(|id| self.effects.get(id))
             .filter_map(|entry| match entry.kind {
                 EntryKind::Service { binding, .. } => Some(binding),
                 _ => None,
             })
             .collect();
-        let mut changed: Vec<SlotKey> = Vec::new();
+        let mut published: Vec<(BindingId, SlotKey)> = Vec::new();
         for binding in bindings {
             if let Some(slot) = self.services.publish(&binding) {
-                changed.push(slot);
+                published.push((binding, slot));
             }
         }
+        let listeners: Vec<EffectId> = entries
+            .iter()
+            .filter(|id| {
+                self.effects
+                    .get(id)
+                    .is_some_and(|entry| matches!(entry.kind, EntryKind::Listener))
+            })
+            .copied()
+            .collect();
+        self.events.unstage_generation(&listeners);
         if let Some(record) = self.fibers.get_mut(&fiber) {
-            record.published_bindings = Some(generation);
+            record.published_generation = Some(generation);
         }
-        for slot in changed {
+        for (binding, slot) in published {
+            self.announce_service_published(binding, &slot);
             self.notify_slot_changed(&slot);
         }
+    }
+
+    /// Announces a publication on the diagnostics stream; ids and names
+    /// only, never payloads (docs/04 §3.4).
+    fn announce_service_published(&self, binding: BindingId, slot: &SlotKey) {
+        let _ = self.diagnostics.send(DiagnosticEvent::ServicePublished {
+            service: slot.0.clone(),
+            namespace: slot.1.as_str(),
+            binding,
+        });
+        #[cfg(feature = "tracing")]
+        tracing::debug!(
+            service = %slot.0,
+            namespace = %slot.1,
+            "service published"
+        );
     }
 
     /// Tries to publish one binding whose managed start just succeeded;
@@ -471,6 +578,7 @@ impl Coordinator {
         };
         if owner.0 == self.root {
             if let Some(slot) = self.services.publish(&binding) {
+                self.announce_service_published(binding, &slot);
                 self.notify_slot_changed(&slot);
             }
             return;
@@ -480,6 +588,7 @@ impl Coordinator {
         });
         if owner_active {
             if let Some(slot) = self.services.publish(&binding) {
+                self.announce_service_published(binding, &slot);
                 self.notify_slot_changed(&slot);
             }
         }
@@ -656,6 +765,17 @@ impl Coordinator {
         for slot in &slots {
             self.notify_slot_changed(slot);
         }
+        // Listeners of the fiber leave the selection (the drains normally
+        // did this; the sweep closes stragglers).
+        let owned_listeners: Vec<EffectId> = self
+            .effects
+            .iter()
+            .filter(|(_, entry)| entry.fiber == fiber && matches!(entry.kind, EntryKind::Listener))
+            .map(|(id, _)| *id)
+            .collect();
+        for effect in owned_listeners {
+            self.unsubscribe_listener(effect);
+        }
         // Forward to the parent's disposal barrier.
         let parent = self.fibers.get(&fiber).and_then(|record| record.parent);
         if let Some(scope) = parent {
@@ -725,6 +845,9 @@ impl Coordinator {
             InternalMsg::ManagedStartFinished { binding, result } => {
                 self.workers.remove(&WorkerKey::ManagedStart(binding));
                 self.on_managed_start_finished(binding, result);
+            }
+            InternalMsg::DispatchFinished { dispatch, result } => {
+                self.on_dispatch_finished(dispatch, result);
             }
         }
     }
@@ -1071,6 +1194,22 @@ impl Coordinator {
             } => {
                 let _ = reply.send(self.handle_lookup_dynamic(scopes, name));
             }
+            Command::Subscribe {
+                scope,
+                scopes,
+                request,
+                reply,
+            } => {
+                let _ = reply.send(self.handle_subscribe(scope, scopes, request));
+            }
+            Command::Dispatch {
+                scope,
+                scopes,
+                request,
+                reply,
+            } => {
+                let _ = reply.send(self.handle_dispatch(scope, scopes, request));
+            }
         }
     }
 
@@ -1227,6 +1366,11 @@ impl Coordinator {
         }
 
         self.enqueue_dirty(fiber);
+        let _ = self
+            .diagnostics
+            .send(DiagnosticEvent::FiberCreated { fiber, definition });
+        #[cfg(feature = "tracing")]
+        tracing::debug!(fiber = fiber.as_u64(), "fiber created");
         Ok(crate::coordinator::command::Admission {
             fiber,
             runtime: runtime_id,
@@ -1659,6 +1803,7 @@ impl Coordinator {
         // start success, and only while the owner is published.
         if start_to_spawn.is_none() && self.owner_is_published(fiber, generation) {
             if let Some(slot) = self.services.publish(&binding) {
+                self.announce_service_published(binding, &slot);
                 self.notify_slot_changed(&slot);
             }
         }
@@ -1905,6 +2050,250 @@ impl Coordinator {
         })
     }
 
+    // ---- Event bus (docs/04 §3) ----
+
+    /// Registers a listener as an effect entry (docs/04 §3.2).
+    ///
+    /// The name's identity (mode, payload/response type) is fixed by the
+    /// first registration and every later one is checked against it
+    /// (V34). Registrations from a `Starting` generation stage until the
+    /// commit; Active/root owners are selected immediately.
+    fn handle_subscribe(
+        &mut self,
+        scope: ScopeRef,
+        scopes: ScopeChain,
+        request: crate::coordinator::command::SubscribeRequest,
+    ) -> Result<EffectAdmission, Error> {
+        self.refuse_if_shutting_down()?;
+        let (fiber, generation, parent_effect) = self.admit_registration_scope(scope)?;
+        let id = EffectId::alloc_global();
+        let scope_id = scopes.resolve(&request.name);
+        let staged = fiber != self.root && !self.owner_is_published(fiber, generation);
+        self.events.subscribe(
+            &request.name,
+            request.mode,
+            request.payload_type,
+            request.response_type,
+            id,
+            scope_id,
+            request.config,
+            staged,
+            request.handler,
+        )?;
+
+        let entry = EffectEntry {
+            fiber,
+            generation,
+            parent: parent_effect,
+            label: format!("listener {}", request.name),
+            state: EntryState::Sealed,
+            kind: EntryKind::Listener,
+            cleanup: None,
+            gate: Gate::new(),
+            children: Vec::new(),
+            child_fibers: Vec::new(),
+            dispose_ops: Vec::new(),
+            final_outcome: None,
+            drain: None,
+            setup_failed: None,
+            unconfirmed: false,
+        };
+        self.effects.insert(id, entry);
+        if let Some(parent) = parent_effect {
+            if let Some(parent_entry) = self.effects.get_mut(&parent) {
+                parent_entry.children.push(id);
+            }
+        }
+        if let Some(record) = self.fibers.get_mut(&fiber) {
+            if parent_effect.is_none() {
+                record.entries.push(id);
+            }
+            record.all_entries.push(id);
+            record.hold += 1;
+        }
+        let _ = self.diagnostics.send(DiagnosticEvent::ListenerRegistered {
+            listener: id,
+            event: self
+                .events
+                .listener(&id)
+                .map(|rec| rec.event.clone())
+                .unwrap_or_default(),
+        });
+        #[cfg(feature = "tracing")]
+        tracing::debug!(listener = id.as_u64(), "listener registered");
+        Ok(EffectAdmission {
+            effect: id,
+            fiber,
+            generation,
+            task: None,
+        })
+    }
+
+    /// Unsubscribes a listener (entry teardown, terminal sweep, once
+    /// completion) and announces it.
+    fn unsubscribe_listener(&mut self, effect: EffectId) {
+        if let Some(event) = self.events.unsubscribe(&effect) {
+            let _ = self.diagnostics.send(DiagnosticEvent::ListenerRetired {
+                listener: effect,
+                event,
+            });
+            #[cfg(feature = "tracing")]
+            tracing::debug!(listener = effect.as_u64(), "listener retired");
+        }
+    }
+
+    /// Admits a dispatch (docs/04 §3.2): validate the identity, snapshot
+    /// the ordered selection, claim per-listener admission (a listener
+    /// disposed after a previous snapshot is skipped; a once listener is
+    /// claimed by exactly one dispatch) and spawn the supervised worker.
+    fn handle_dispatch(
+        &mut self,
+        _scope: ScopeRef,
+        scopes: ScopeChain,
+        request: crate::coordinator::command::DispatchRequest,
+    ) -> Result<DispatchId, Error> {
+        self.refuse_if_shutting_down()?;
+        let name = request.name.clone();
+        let Some(record) = self.events.event(&name) else {
+            return Err(Error::EventUnknown {
+                event: name.clone(),
+            });
+        };
+        if record.mode != request.mode
+            || record.payload_type != request.payload_type
+            || record.response_type != request.response_type
+        {
+            return Err(Error::EventConflict {
+                event: name.clone(),
+                reason: format!(
+                    "dispatch identity ({}, payload {:?}) does not match the registered ({}, payload {:?})",
+                    request.mode.as_str(),
+                    request.payload_type,
+                    record.mode.as_str(),
+                    record.payload_type
+                ),
+            });
+        }
+        let dispatch_scope = scopes.resolve(&name);
+        let selected: Vec<EffectId> = record
+            .listeners
+            .iter()
+            .copied()
+            .filter(|id| {
+                self.events.listener(id).is_some_and(|rec| {
+                    !rec.staged && (!request.scoped || rec.global || rec.scope == dispatch_scope)
+                })
+            })
+            .collect();
+
+        // Admission claims, in snapshot order (docs/04 §3.2): each
+        // listener must still be live and its owner published — this is
+        // the expired-snapshot interception (V33).
+        let mut claimed: Vec<(EffectId, std::sync::Arc<ListenerHandler>)> = Vec::new();
+        let mut once_entries: Vec<EffectId> = Vec::new();
+        for id in selected {
+            // Collect everything the claim needs before mutating: the
+            // borrow of the listener record must not cross the claim.
+            let (handler, is_once) = match self.events.listener(&id) {
+                Some(listener) if !listener.claimed => {
+                    (std::sync::Arc::clone(&listener.handler), listener.once)
+                }
+                _ => continue,
+            };
+            let owner = match self.effects.get(&id) {
+                Some(entry) if !entry.state.is_terminal() => (entry.fiber, entry.generation),
+                _ => continue,
+            };
+            if !self.owner_is_published(owner.0, owner.1) {
+                continue;
+            }
+            if is_once {
+                // Atomic once claim (V32): the listener leaves the
+                // selection in this same serial transition, so of any
+                // number of racing dispatches exactly one claims it.
+                self.events
+                    .event_mut(&name)
+                    .expect("checked above")
+                    .listeners
+                    .retain(|candidate| *candidate != id);
+                if let Some(rec) = self.events.listener_mut(&id) {
+                    rec.claimed = true;
+                }
+                once_entries.push(id);
+            }
+            claimed.push((id, handler));
+        }
+
+        if self.workers.len() >= self.limits.max_workers {
+            return Err(Error::CapacityExceeded {
+                reason: format!(
+                    "dispatch refused: live worker budget ({}) exhausted",
+                    self.limits.max_workers
+                ),
+            });
+        }
+
+        let dispatch = DispatchId::alloc_global();
+        self.dispatches.insert(
+            dispatch,
+            DispatchRecord {
+                event: name.clone(),
+                claimed: claimed.iter().map(|(id, _)| *id).collect(),
+                once_entries,
+                completion: request.completion,
+            },
+        );
+        let job = supervisor::DispatchJob {
+            dispatch,
+            mode: request.mode,
+            handlers: claimed,
+            payload: request.payload,
+            final_: request.final_,
+            caller_depth: request.caller_depth,
+        };
+        let ticket = supervisor::spawn_dispatch(job, self.internal_tx.clone());
+        self.workers.insert(WorkerKey::Dispatch(dispatch), ticket);
+        let _ = self.diagnostics.send(DiagnosticEvent::DispatchStarted {
+            dispatch,
+            event: name,
+        });
+        #[cfg(feature = "tracing")]
+        tracing::debug!(dispatch = dispatch.as_u64(), "dispatch admitted");
+        Ok(dispatch)
+    }
+
+    /// A dispatch worker settled: resolve the caller's completion,
+    /// retire once listeners (both the listener table and the effect
+    /// ledger, V32) and release drain waits (V33).
+    fn on_dispatch_finished(
+        &mut self,
+        dispatch: DispatchId,
+        result: Result<DispatchOutcome, Error>,
+    ) {
+        self.workers.remove(&WorkerKey::Dispatch(dispatch));
+        let Some(record) = self.dispatches.remove(&dispatch) else {
+            self.stale_discarded += 1;
+            self.satisfy_drain_wait(&QuiesceWait::Dispatch(dispatch));
+            self.drive_drains();
+            return;
+        };
+        // A dropped caller cancels only the observation: the send fails
+        // harmlessly and the bookkeeping still runs (docs/03 §4.3).
+        let _ = record.completion.send(result);
+        for effect in record.once_entries {
+            self.unsubscribe_listener(effect);
+            self.retire_entry(effect);
+        }
+        let _ = self.diagnostics.send(DiagnosticEvent::DispatchFinished {
+            dispatch,
+            event: record.event,
+        });
+        #[cfg(feature = "tracing")]
+        tracing::debug!(dispatch = dispatch.as_u64(), "dispatch finished");
+        self.satisfy_drain_wait(&QuiesceWait::Dispatch(dispatch));
+        self.drive_drains();
+    }
+
     /// Starts (or refuses) the supervised task of a registered entry.
     fn start_task(&mut self, effect: EffectId, task: TaskId) {
         let factory = {
@@ -2055,13 +2444,15 @@ impl Coordinator {
             }
             return Ok(operation);
         }
-        // Start a subtree drain rooted at this entry.
+        // Register the waiter **before** starting the drain: a subtree
+        // without cleanups finalizes synchronously inside `start_drain`,
+        // and a waiter pushed afterwards would never be resolved.
         let operation = self.new_operation(fiber);
         let op_id = operation.operation_id();
-        self.start_drain(fiber, DrainKind::Subtree { root: effect }, vec![effect]);
         if let Some(entry) = self.effects.get_mut(&effect) {
             entry.dispose_ops.push(op_id);
         }
+        self.start_drain(fiber, DrainKind::Subtree { root: effect }, vec![effect]);
         Ok(operation)
     }
 
@@ -2082,6 +2473,7 @@ impl Coordinator {
         let mut tasks_running: Vec<(EffectId, TaskId)> = Vec::new();
         let mut child_fibers: Vec<FiberId> = Vec::new();
         let mut managed_starts: Vec<BindingId> = Vec::new();
+        let mut listeners: Vec<EffectId> = Vec::new();
         for entry_id in &queue {
             let Some(entry) = self.effects.get(entry_id) else {
                 continue;
@@ -2103,8 +2495,20 @@ impl Coordinator {
                     managed_starts.push(*binding);
                 }
             }
+            if matches!(entry.kind, EntryKind::Listener) {
+                listeners.push(*entry_id);
+            }
             child_fibers.extend(entry.child_fibers.iter().copied());
         }
+        let _ = &listeners;
+        // Admitted dispatches touching this subtree are in-flight work:
+        // they are not aborted, the drain waits for them (V33).
+        let dispatch_waits: Vec<DispatchId> = self
+            .dispatches
+            .iter()
+            .filter(|(_, record)| record.claimed.iter().any(|id| queue.contains(id)))
+            .map(|(dispatch, _)| *dispatch)
+            .collect();
 
         // Claim pass: mark Disposing, close gates, detach never-started
         // task factories (their Drop is user code — retire off-actor),
@@ -2114,6 +2518,7 @@ impl Coordinator {
         // stop before any cleanup future runs (docs/04 §1.3).
         let mut retire_factories: Vec<crate::effect::TaskFn> = Vec::new();
         let mut retired_bindings: Vec<BindingId> = Vec::new();
+        let mut retired_listeners: Vec<EffectId> = Vec::new();
         for entry_id in &queue {
             let Some(entry) = self.effects.get_mut(entry_id) else {
                 continue;
@@ -2128,6 +2533,9 @@ impl Coordinator {
             }
             if let EntryKind::Service { binding, .. } = &entry.kind {
                 retired_bindings.push(*binding);
+            }
+            if matches!(entry.kind, EntryKind::Listener) {
+                retired_listeners.push(*entry_id);
             }
             if let Some(parent) = entry.parent {
                 if let Some(parent_entry) = self.effects.get_mut(&parent) {
@@ -2150,6 +2558,9 @@ impl Coordinator {
             if let Some(slot) = slot {
                 retired_slots.push(slot);
             }
+        }
+        for effect in &retired_listeners {
+            self.unsubscribe_listener(*effect);
         }
         if let Some(record) = self.fibers.get_mut(&fiber) {
             record.entries.retain(|e| !queue.contains(e));
@@ -2178,6 +2589,9 @@ impl Coordinator {
                 ticket.abort.abort();
             }
             quiesce.push(QuiesceWait::ManagedStart(*binding));
+        }
+        for dispatch in dispatch_waits {
+            quiesce.push(QuiesceWait::Dispatch(dispatch));
         }
         // Consumers observe the retirement immediately: dirty re-queue
         // plus synchronous stamp invalidation (docs/04 §2).
@@ -2224,6 +2638,9 @@ impl Coordinator {
                 QuiesceWait::ManagedStart(b) => drain
                     .quiesce
                     .retain(|w| *w != QuiesceWait::ManagedStart(*b)),
+                QuiesceWait::Dispatch(d) => {
+                    drain.quiesce.retain(|w| *w != QuiesceWait::Dispatch(*d))
+                }
             }
         }
     }
@@ -2466,6 +2883,8 @@ impl Coordinator {
             retirement_pending,
             retirement_completed,
             service_bindings_live: self.services.bindings_live(),
+            listeners_live: self.events.listeners_live(),
+            dispatches_in_flight: self.dispatches.len(),
         }
     }
 

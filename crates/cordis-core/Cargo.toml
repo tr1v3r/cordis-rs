@@ -22,6 +22,7 @@ tokio = { version = "1.53", default-features = false, features = [
     "time",
     "macros",
 ] }
+tracing = { version = "0.1.44", default-features = false, features = ["std"], optional = true }
 
 [dev-dependencies]
 # Tests exercise the coordinator on both scheduler flavors required by
@@ -36,3 +37,6 @@ tokio = { version = "1.53", default-features = false, features = [
 
 [lints]
 workspace = true
+
+[features]
+tracing = ["dep:tracing"]
