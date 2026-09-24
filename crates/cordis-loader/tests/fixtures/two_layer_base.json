@@ -1,0 +1,5 @@
+[
+  {"id":"db","name":"db","config":{"path":"a.db","pool":4,"retries":3}},
+  {"id":"api","name":"api","config":{"name":"v1"}},
+  {"id":"cache","name":"cache","group":true,"plugins":[{"id":"lru","name":"lru"},{"id":"arc","name":"arc","disabled":true}]}
+]

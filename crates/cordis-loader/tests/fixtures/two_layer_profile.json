@@ -1,0 +1,4 @@
+[
+  {"id":"db","config":{"path":"prod.db","pool":16}},
+  {"id":"api","label":"edge"}
+]

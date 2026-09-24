@@ -1,0 +1,49 @@
+===== two_layer_config_replace =====
+# cordis-go config dump
+# layers: base -> profile
+- id: "db"  # from base; patched by profile
+  name: "db"
+  config: {"path": "prod.db", "pool": 16}
+- id: "api"  # from base; patched by profile
+  name: "api"
+  label: "edge"
+  config: {"name": "v1"}
+- id: "cache"  # group  # from base
+  name: "cache"
+  plugins:
+    - id: "lru"  # from base
+      name: "lru"
+    - id: "arc"  # from base
+      name: "arc"
+      disabled: true
+===== group_children =====
+# cordis-go config dump
+# layers: base -> profile
+- id: "stack"  # group  # from base
+  inject: ["logger"]
+  plugins:
+    - id: "store"  # from base; patched by profile
+      name: "store"
+      config: {"dsn": "postgres://b"}
+    - id: "sync"  # group  # from base
+      plugins:
+        - id: "syncer"  # from base; patched by profile
+          name: "syncer"
+          disabled: true
+===== insert_and_patch_order =====
+# cordis-go config dump
+# layers: base -> insert -> patch
+- id: "a"  # from base
+  name: "pa"
+- id: "b"  # from base; patched by patch
+  name: "pb"
+  config: {"v": 2}
+- id: "c"  # from insert; patched by patch
+  name: "pc"
+  disabled: true
+===== big_numbers =====
+# cordis-go config dump
+# layers: base
+- id: "big"  # from base
+  name: "big"
+  config: {"imax": 9223372036854775807, "imin": -9223372036854775808, "n": 9007199254740993, "neg": -9007199254740993, "r": 1.5, "umax": 18446744073709551615}

@@ -1,0 +1,6 @@
+[
+  {"id":"stack","group":true,"inject":["logger"],"plugins":[
+    {"id":"store","name":"store","config":{"dsn":"postgres://a"}},
+    {"id":"sync","group":true,"plugins":[{"id":"syncer","name":"syncer"}]}
+  ]}
+]

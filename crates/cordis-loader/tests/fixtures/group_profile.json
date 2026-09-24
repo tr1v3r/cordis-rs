@@ -1,0 +1,4 @@
+[
+  {"id":"store","config":{"dsn":"postgres://b"}},
+  {"id":"syncer","disabled":true}
+]

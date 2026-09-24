@@ -1,0 +1,4 @@
+[
+  {"id":"a","name":"pa"},
+  {"id":"b","name":"pb","config":{"v":1}}
+]

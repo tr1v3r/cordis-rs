@@ -12,6 +12,12 @@ repository.workspace = true
 # The loader reconciles configuration into cordis-core fibers; no other
 # dependency is pulled in at scaffold stage.
 cordis-core = { path = "../cordis-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1.53", default-features = false, features = ["rt", "sync", "time"] }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+serde_json = "1"
