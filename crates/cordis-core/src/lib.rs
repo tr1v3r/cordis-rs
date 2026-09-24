@@ -24,8 +24,15 @@
 //!   tokens with stale-completion verification; desired-revision
 //!   latest-wins with operation receipts; callback-origin deadlock
 //!   refusal; root shutdown with quarantine reporting.
+//! - the **effect system (P3)**: explicit scopes with synchronous
+//!   admission gates; entries published before their workers run;
+//!   nested teardown that quiesces a subtree before running cleanups
+//!   (owner first, children in reverse); awaitable cleanups with
+//!   aggregated reports, panic/timeout quarantine; supervised
+//!   `spawn_prepare`/`spawn_on_activate` tasks; child fibers owned by
+//!   their registering scope; a retirement lane on the blocking pool.
 //!
-//! Effects, services and events (P3–P5) attach to these seams.
+//! Services and events (P4–P5) attach to these seams.
 //!
 //! ## Boundaries
 //!
@@ -107,6 +114,7 @@
 mod app;
 mod context;
 mod coordinator;
+mod effect;
 mod error;
 mod id;
 mod machine;
@@ -117,8 +125,11 @@ pub use app::{App, AppBuilder, WeakApp};
 pub use context::{Context, ErasedFiberHandle, FiberHandle, LoadReceipt};
 pub use coordinator::KernelStats;
 pub use coordinator::operation::Operation;
+pub use effect::{Cleanup, Registration};
 pub use error::{CleanupError, Error, PluginError};
-pub use id::{BindingId, DefinitionId, EffectId, FiberId, GenerationId, OperationId, RuntimeId};
+pub use id::{
+    BindingId, DefinitionId, EffectId, FiberId, GenerationId, OperationId, RuntimeId, TaskId,
+};
 pub use machine::{FiberState, FiberStatus, FiberView};
 pub use plugin::{Plugin, define};
 pub use report::{

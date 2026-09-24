@@ -19,7 +19,8 @@ use tokio::task::JoinHandle;
 use crate::context::Context;
 use crate::coordinator::callback::CALLBACK_ORIGIN;
 use crate::coordinator::command::InternalMsg;
-use crate::id::{FiberId, GenerationId};
+use crate::effect::{Cleanup, CloseGateOnDrop, Gate, SetupFn, TaskFn};
+use crate::id::{EffectId, FiberId, GenerationId, TaskId};
 use crate::plugin::{AnyConfig, ErasedPlugin};
 
 /// Terminal result of one activation worker, as joined by the watcher.
@@ -33,11 +34,157 @@ pub(crate) enum WorkerResult {
     FuturePanicked(String),
 }
 
+/// Terminal result of an effect setup worker.
+#[derive(Debug)]
+pub(crate) enum SetupResult {
+    /// The setup body returned; a `Cleanup` is present when it produced
+    /// one (docs/03-runtime.md §6.4: returned cleanups always enter the
+    /// ledger, even for stale generations).
+    Done(Result<Cleanup, crate::error::PluginError>),
+    /// The closure that builds the setup future panicked.
+    FactoryPanicked(String),
+    /// The setup future panicked while being polled.
+    FuturePanicked(String),
+    /// The worker was aborted (cancelled setup); its gate is closed.
+    Aborted,
+}
+
+/// Terminal result of a cleanup worker.
+#[derive(Debug)]
+pub(crate) enum CleanupResult {
+    /// The cleanup future returned.
+    Done(Result<(), crate::error::CleanupError>),
+    /// The cleanup future panicked while being polled: release unknown.
+    Panicked(String),
+    /// The worker was aborted (deadline): release unknown.
+    Aborted,
+}
+
+/// Terminal result of a supervised task worker.
+#[derive(Debug)]
+pub(crate) enum TaskResult {
+    /// The task future returned.
+    Done(Result<(), crate::error::PluginError>),
+    /// The task future panicked while being polled.
+    Panicked(String),
+    /// The task was aborted during teardown.
+    Aborted,
+}
+
 /// A live worker registered with the supervisor: the abort handle stays
 /// with the actor until the watcher reports the exit, because an issued
 /// abort must not erase the join record (docs/03-runtime.md §8).
 pub(crate) struct WorkerTicket {
     pub(crate) abort: tokio::task::AbortHandle,
+}
+
+/// Spawns an effect setup worker for `effect` plus its watcher.
+///
+/// The worker holds a [`CloseGateOnDrop`] guard for the scope's gate: the
+/// gate closes synchronously on every exit path (return, panic unwind,
+/// abort) before the watcher delivers `SetupFinished`
+/// (docs/03-runtime.md §6.2).
+pub(crate) fn spawn_setup(
+    effect: EffectId,
+    setup: SetupFn,
+    ctx: Context,
+    gate: Gate,
+    internal: mpsc::UnboundedSender<InternalMsg>,
+) -> WorkerTicket {
+    let worker: JoinHandle<SetupResult> = tokio::spawn(async move {
+        let _gate_guard = CloseGateOnDrop(gate);
+        CALLBACK_ORIGIN
+            .scope((), async {
+                match catch_unwind(AssertUnwindSafe(|| setup(ctx))) {
+                    Err(panic) => SetupResult::FactoryPanicked(panic_payload(panic)),
+                    Ok(fut) => SetupResult::Done(fut.await),
+                }
+            })
+            .await
+    });
+    let abort = worker.abort_handle();
+    tokio::spawn(async move {
+        let result = match worker.await {
+            Ok(report) => report,
+            Err(join_error) if join_error.is_panic() => {
+                SetupResult::FuturePanicked(panic_payload(join_error.into_panic()))
+            }
+            Err(_) => SetupResult::Aborted,
+        };
+        let _ = internal.send(InternalMsg::SetupFinished { effect, result });
+    });
+    WorkerTicket { abort }
+}
+
+/// Spawns a cleanup worker for `effect` plus its watcher.
+///
+/// Cleanups run inside the callback scope: lifecycle waits inside a
+/// cleanup are refused with `WouldDeadlock` (docs/03-runtime.md §7).
+pub(crate) fn spawn_cleanup(
+    effect: EffectId,
+    cleanup: Cleanup,
+    internal: mpsc::UnboundedSender<InternalMsg>,
+) -> WorkerTicket {
+    let worker: JoinHandle<CleanupResult> = tokio::spawn(async move {
+        CALLBACK_ORIGIN
+            .scope((), async {
+                match catch_unwind(AssertUnwindSafe(|| cleanup.into_inner()())) {
+                    Err(panic) => CleanupResult::Panicked(panic_payload(panic)),
+                    Ok(fut) => CleanupResult::Done(fut.await),
+                }
+            })
+            .await
+    });
+    let abort = worker.abort_handle();
+    tokio::spawn(async move {
+        let result = match worker.await {
+            Ok(report) => report,
+            Err(join_error) if join_error.is_panic() => {
+                CleanupResult::Panicked(panic_payload(join_error.into_panic()))
+            }
+            Err(_) => CleanupResult::Aborted,
+        };
+        let _ = internal.send(InternalMsg::CleanupFinished { effect, result });
+    });
+    WorkerTicket { abort }
+}
+
+/// Spawns a supervised task worker plus its watcher.
+///
+/// Task `Err`/panic fails the owning generation and requests teardown;
+/// normal completion does not (docs/02-api.md §6).
+pub(crate) fn spawn_task(
+    effect: EffectId,
+    task: TaskId,
+    factory: TaskFn,
+    internal: mpsc::UnboundedSender<InternalMsg>,
+) -> WorkerTicket {
+    let worker: JoinHandle<TaskResult> = tokio::spawn(async move {
+        CALLBACK_ORIGIN
+            .scope((), async {
+                match catch_unwind(AssertUnwindSafe(factory)) {
+                    Err(panic) => TaskResult::Panicked(panic_payload(panic)),
+                    Ok(fut) => TaskResult::Done(fut.await),
+                }
+            })
+            .await
+    });
+    let abort = worker.abort_handle();
+    tokio::spawn(async move {
+        let result = match worker.await {
+            Ok(report) => report,
+            Err(join_error) if join_error.is_panic() => {
+                TaskResult::Panicked(panic_payload(join_error.into_panic()))
+            }
+            Err(_) => TaskResult::Aborted,
+        };
+        let _ = internal.send(InternalMsg::TaskFinished {
+            effect,
+            task,
+            result,
+        });
+    });
+    WorkerTicket { abort }
 }
 
 /// Spawns the activation worker for `(fiber, generation)` plus its
@@ -154,6 +301,7 @@ mod tests {
             InternalMsg::ActivationDone { result, .. } => {
                 assert!(matches!(result, WorkerResult::FactoryPanicked(_)));
             }
+            other => panic!("unexpected message: {other:?}"),
         }
         drop(plugin);
     }
@@ -198,6 +346,7 @@ mod tests {
                     matches!(result, WorkerResult::FuturePanicked(msg) if msg.contains("apply boom"))
                 );
             }
+            other => panic!("unexpected message: {other:?}"),
         }
     }
 
@@ -227,6 +376,7 @@ mod tests {
             InternalMsg::ActivationDone { result, .. } => {
                 assert!(matches!(result, WorkerResult::Done(Ok(()))));
             }
+            other => panic!("unexpected message: {other:?}"),
         }
         assert_eq!(ran.load(Ordering::SeqCst), 1);
     }

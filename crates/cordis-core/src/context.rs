@@ -2,7 +2,9 @@
 //! code act through (docs/02-api.md §3, §7).
 
 use std::fmt;
+use std::future::Future;
 use std::marker::PhantomData;
+use std::pin::Pin;
 use std::sync::{Arc, Weak};
 use std::time::Instant;
 
@@ -11,8 +13,9 @@ use tokio::sync::{oneshot, watch};
 use crate::app::AppInner;
 use crate::coordinator::callback::in_callback;
 use crate::coordinator::{Command, ScopeRef};
-use crate::error::Error;
-use crate::id::{DefinitionId, FiberId, GenerationId, RuntimeId};
+use crate::effect::Registration;
+use crate::error::{CleanupError, Error, PluginError};
+use crate::id::{DefinitionId, EffectId, FiberId, GenerationId, RuntimeId};
 use crate::machine::{FiberState, FiberStatus, FiberView};
 use crate::plugin::Plugin;
 
@@ -57,6 +60,17 @@ impl fmt::Debug for Context {
                     .field("fiber", &fiber)
                     .field("generation", &generation)
                     .finish(),
+                ScopeRef::Effect {
+                    fiber,
+                    generation,
+                    effect,
+                } => f
+                    .debug_struct("Context")
+                    .field("app", &inner.name())
+                    .field("fiber", &fiber)
+                    .field("generation", &generation)
+                    .field("effect", &effect)
+                    .finish(),
             },
             None => f.debug_struct("Context").field("app", &"<closed>").finish(),
         }
@@ -82,10 +96,49 @@ impl Context {
         }
     }
 
+    /// The derived scope context handed to an effect setup body.
+    pub(crate) fn effect_scope(
+        app: Weak<AppInner>,
+        fiber: FiberId,
+        generation: GenerationId,
+        effect: EffectId,
+    ) -> Self {
+        Self {
+            app,
+            scope: ScopeRef::Effect {
+                fiber,
+                generation,
+                effect,
+            },
+        }
+    }
+
+    /// The effect entry this context is scoped to, if any.
+    pub fn effect_id(&self) -> Option<EffectId> {
+        match self.scope {
+            ScopeRef::Effect { effect, .. } => Some(effect),
+            _ => None,
+        }
+    }
+
+    /// Creates another immutable view of the same scope
+    /// (docs/02-api.md §7). Forking never extends lifetimes; service
+    /// visibility rules attach in P4.
+    pub fn fork(&self) -> Context {
+        self.clone()
+    }
+
+    /// Creates an isolated view: in P3 this is still the same scope —
+    /// isolation domains arrive with the service registry (P4) and will
+    /// only change view resolution, never ownership.
+    pub fn isolate(&self) -> Context {
+        self.clone()
+    }
+
     /// The fiber this context is scoped to, if it is a generation context.
     pub fn fiber_id(&self) -> Option<FiberId> {
         match self.scope {
-            ScopeRef::Generation { fiber, .. } => Some(fiber),
+            ScopeRef::Generation { fiber, .. } | ScopeRef::Effect { fiber, .. } => Some(fiber),
             ScopeRef::Root => None,
         }
     }
@@ -94,7 +147,9 @@ impl Context {
     /// context.
     pub fn generation_id(&self) -> Option<GenerationId> {
         match self.scope {
-            ScopeRef::Generation { generation, .. } => Some(generation),
+            ScopeRef::Generation { generation, .. } | ScopeRef::Effect { generation, .. } => {
+                Some(generation)
+            }
             ScopeRef::Root => None,
         }
     }
@@ -156,6 +211,131 @@ impl Context {
             fiber,
             operation: admission.operation,
         })
+    }
+
+    /// Registers a cleanup step that runs when this scope tears down
+    /// (docs/02-api.md §6).
+    ///
+    /// The entry is published (owned by the scope) before any user code
+    /// runs; cleanups execute at most once, on supervised workers, in
+    /// ledger order. Dropping the returned [`Registration`] does **not**
+    /// unregister it.
+    pub async fn on_dispose<F, Fut>(
+        &self,
+        label: impl Into<String>,
+        cleanup: F,
+    ) -> Result<Registration, Error>
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: Future<Output = Result<(), CleanupError>> + Send + 'static,
+    {
+        let request = crate::coordinator::RegisterRequest::OnDispose(Box::new(move || {
+            Box::pin(cleanup()) as crate::effect::CleanupFuture
+        }));
+        let admission = self.submit_register(label, request).await?;
+        Ok(self.registration_from(admission))
+    }
+
+    /// Runs `setup` on a supervised worker with a **derived scope**
+    /// (docs/02-api.md §6).
+    ///
+    /// Registrations through the derived context become children of this
+    /// effect; registrations through `self` stay siblings. The worker
+    /// closes the scope's admission gate synchronously on every exit
+    /// path, so a registration arriving after the body returned is
+    /// rejected with [`Error::InactiveScope`] (V13). A returned
+    /// [`Cleanup`] always enters the ledger, even if the generation went
+    /// stale meanwhile, and runs exactly once (V14).
+    pub async fn effect<F, Fut>(
+        &self,
+        label: impl Into<String>,
+        setup: F,
+    ) -> Result<Registration, Error>
+    where
+        F: FnOnce(Context) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<crate::effect::Cleanup, PluginError>> + Send + 'static,
+    {
+        let request = crate::coordinator::RegisterRequest::Effect(Box::new(move |ctx: Context| {
+            Box::pin(setup(ctx))
+                as Pin<Box<dyn Future<Output = Result<crate::effect::Cleanup, PluginError>> + Send>>
+        }));
+        let admission = self.submit_register(label, request).await?;
+        Ok(self.registration_from(admission))
+    }
+
+    /// Registers a supervised task that starts once the generation
+    /// commits (docs/02-api.md §6).
+    ///
+    /// The task is registered before it can run; the supervisor holds its
+    /// `JoinHandle` until it is joined. Task `Err`/panic fails the owning
+    /// generation and requests teardown; normal completion does not.
+    /// Setup bodies must not await a task registered this way — it starts
+    /// only after `Active` commits, so such a wait could never resolve.
+    pub async fn spawn_on_activate<F, Fut>(
+        &self,
+        label: impl Into<String>,
+        task: F,
+    ) -> Result<Registration, Error>
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: Future<Output = Result<(), PluginError>> + Send + 'static,
+    {
+        let request = crate::coordinator::RegisterRequest::Task {
+            on_activate: true,
+            factory: Box::new(move || {
+                Box::pin(task()) as Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send>>
+            }),
+        };
+        let admission = self.submit_register(label, request).await?;
+        Ok(self.registration_from(admission))
+    }
+
+    /// Registers a supervised task that starts immediately: for
+    /// initialization work that genuinely must run during startup
+    /// (docs/02-api.md §6).
+    pub async fn spawn_prepare<F, Fut>(
+        &self,
+        label: impl Into<String>,
+        task: F,
+    ) -> Result<Registration, Error>
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: Future<Output = Result<(), PluginError>> + Send + 'static,
+    {
+        let request = crate::coordinator::RegisterRequest::Task {
+            on_activate: false,
+            factory: Box::new(move || {
+                Box::pin(task()) as Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send>>
+            }),
+        };
+        let admission = self.submit_register(label, request).await?;
+        Ok(self.registration_from(admission))
+    }
+
+    fn registration_from(&self, admission: crate::effect::EffectAdmission) -> Registration {
+        Registration {
+            app: self.app.clone(),
+            effect: admission.effect,
+            fiber: admission.fiber,
+            generation: admission.generation,
+            task: admission.task,
+        }
+    }
+
+    async fn submit_register(
+        &self,
+        label: impl Into<String>,
+        request: crate::coordinator::RegisterRequest,
+    ) -> Result<crate::effect::EffectAdmission, Error> {
+        let inner = self.app.upgrade().ok_or(Error::HostClosed)?;
+        inner
+            .submit(|reply| Command::Register {
+                scope: self.scope,
+                request,
+                label: label.into(),
+                reply,
+            })
+            .await?
     }
 }
 

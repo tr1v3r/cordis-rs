@@ -25,6 +25,10 @@ static NEXT_FIBER_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_GENERATION_ID: AtomicU64 = AtomicU64::new(1);
 /// Global allocator for operation identities.
 static NEXT_OPERATION_ID: AtomicU64 = AtomicU64::new(1);
+/// Global allocator for effect identities.
+static NEXT_EFFECT_ID: AtomicU64 = AtomicU64::new(1);
+/// Global allocator for supervised task identities (task effects).
+static NEXT_TASK_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Declares an id newtype over a `u64` counter value.
 ///
@@ -151,6 +155,31 @@ impl OperationId {
     /// issues the operation receipt returned to the caller.
     pub(crate) fn alloc_global() -> Self {
         Self(NEXT_OPERATION_ID.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
+impl EffectId {
+    /// Allocates the next process-global effect identity.
+    ///
+    /// Called by the coordinator when an effect entry is published (before
+    /// its setup worker starts, docs/03-runtime.md §6.1).
+    pub(crate) fn alloc_global() -> Self {
+        Self(NEXT_EFFECT_ID.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
+// Identity of one supervised task (a `ctx.spawn_*` registration).
+id_newtype!(
+    /// Identity of a supervised task registered through a context
+    /// (`spawn_prepare` / `spawn_on_activate`). Managed by the task ledger
+    /// from P3.
+    TaskId
+);
+
+impl TaskId {
+    /// Allocates the next process-global supervised-task identity.
+    pub(crate) fn alloc_global() -> Self {
+        Self(NEXT_TASK_ID.fetch_add(1, Ordering::Relaxed))
     }
 }
 

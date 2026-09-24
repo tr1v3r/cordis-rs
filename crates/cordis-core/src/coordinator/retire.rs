@@ -7,6 +7,11 @@
 //! references into this lane, and a dedicated task drops them off the
 //! actor's critical path.
 //!
+//! User `Drop` code may block a native thread (`std::thread::sleep`,
+//! FFI, busy loops). Dropping on an ordinary task would pin a scheduler
+//! worker and could stall the coordinator itself (V38); the lane
+//! therefore runs every drop on Tokio's dedicated blocking pool.
+//!
 //! The lane keeps pending/completed counters so tests and diagnostics can
 //! assert that retirement actually drained instead of assuming it.
 
@@ -32,13 +37,19 @@ impl RetireLane {
         let pending = Arc::new(AtomicU64::new(0));
         let completed = Arc::new(AtomicU64::new(0));
 
-        let lane_pending = Arc::clone(&pending);
-        let lane_completed = Arc::clone(&completed);
+        let pending_for_lane = Arc::clone(&pending);
+        let completed_for_lane = Arc::clone(&completed);
         tokio::spawn(async move {
             while let Some(item) = rx.recv().await {
-                drop(item);
-                lane_pending.fetch_sub(1, Ordering::Relaxed);
-                lane_completed.fetch_add(1, Ordering::Relaxed);
+                // A blocked user Drop must never pin a scheduler worker:
+                // drops run on the dedicated blocking pool (V38).
+                let lane_pending = Arc::clone(&pending_for_lane);
+                let lane_completed = Arc::clone(&completed_for_lane);
+                tokio::task::spawn_blocking(move || {
+                    drop(item);
+                    lane_pending.fetch_sub(1, Ordering::Relaxed);
+                    lane_completed.fetch_add(1, Ordering::Relaxed);
+                });
             }
         });
 

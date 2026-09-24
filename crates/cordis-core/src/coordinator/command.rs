@@ -10,10 +10,11 @@ use std::sync::Arc;
 
 use tokio::sync::{mpsc, oneshot, watch};
 
-use super::supervisor::WorkerResult;
+use super::supervisor::{CleanupResult, SetupResult, TaskResult, WorkerResult};
 use crate::coordinator::operation::Operation;
+use crate::effect::{CleanupFuture, EffectAdmission, SetupFn, TaskFn};
 use crate::error::Error;
-use crate::id::{DefinitionId, FiberId, GenerationId, RuntimeId};
+use crate::id::{DefinitionId, EffectId, FiberId, GenerationId, RuntimeId, TaskId};
 use crate::machine::FiberView;
 use crate::plugin::AnyConfig;
 use crate::report::{ShutdownOptions, ShutdownReport};
@@ -35,6 +36,16 @@ pub(crate) enum ScopeRef {
         fiber: FiberId,
         /// The generation the context belongs to.
         generation: GenerationId,
+    },
+    /// The derived scope of one effect entry (docs/03-runtime.md §6).
+    /// Registrations through it become children of the effect.
+    Effect {
+        /// The owning fiber.
+        fiber: FiberId,
+        /// The generation the scope belongs to.
+        generation: GenerationId,
+        /// The effect entry owning the scope.
+        effect: EffectId,
     },
 }
 
@@ -98,12 +109,37 @@ pub(crate) enum Command {
         options: ShutdownOptions,
         reply: oneshot::Sender<ShutdownReport>,
     },
+    /// Register an effect entry, a plain cleanup or a supervised task
+    /// under a scope. The entry is published before any user code runs
+    /// (I05); setup/task bodies execute on supervised workers.
+    Register {
+        scope: ScopeRef,
+        request: RegisterRequest,
+        label: String,
+        reply: oneshot::Sender<Result<EffectAdmission, Error>>,
+    },
+    /// Submit disposal of an effect subtree (manual `Registration::dispose`).
+    DisposeEffect {
+        effect: EffectId,
+        reply: oneshot::Sender<Result<Operation, Error>>,
+    },
+}
+
+/// The erased payload of a registration request.
+pub(crate) enum RegisterRequest {
+    /// `on_dispose`: a cleanup with no setup phase.
+    OnDispose(Box<dyn FnOnce() -> CleanupFuture + Send>),
+    /// `effect`: a setup body receiving the derived scope context.
+    Effect(SetupFn),
+    /// `spawn_prepare` / `spawn_on_activate`.
+    Task { factory: TaskFn, on_activate: bool },
 }
 
 /// Internal completion messages (docs/03-runtime.md §4).
 ///
 /// One terminal message per accepted worker, sent by the supervisor
 /// watcher after joining the worker's `JoinHandle`.
+#[derive(Debug)]
 pub(crate) enum InternalMsg {
     /// An activation worker finished (or panicked, or was aborted) and its
     /// `JoinHandle` has been joined.
@@ -111,6 +147,24 @@ pub(crate) enum InternalMsg {
         fiber: FiberId,
         generation: GenerationId,
         result: WorkerResult,
+    },
+    /// An effect setup body finished (or panicked, or was aborted); its
+    /// gate was closed synchronously before this message was sent.
+    SetupFinished {
+        effect: EffectId,
+        result: SetupResult,
+    },
+    /// A cleanup step finished (or panicked, or was aborted); the release
+    /// is only confirmed for `Done(Ok(()))`.
+    CleanupFinished {
+        effect: EffectId,
+        result: CleanupResult,
+    },
+    /// A supervised task finished (or panicked, or was aborted).
+    TaskFinished {
+        effect: EffectId,
+        task: TaskId,
+        result: TaskResult,
     },
 }
 
@@ -121,6 +175,10 @@ pub(crate) enum InternalMsg {
 pub struct KernelStats {
     /// Fibers that have not reached a terminal state yet.
     pub fibers_live: usize,
+    /// Effect entries not yet fully disposed (Preparing/Sealed/Disposing).
+    pub effects_live: usize,
+    /// Effect subtree teardowns currently in progress.
+    pub drains_live: usize,
     /// Plugin runtimes currently registered.
     pub runtimes_live: usize,
     /// Activation workers whose exit has not been joined/reported yet.

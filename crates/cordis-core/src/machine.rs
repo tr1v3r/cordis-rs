@@ -128,6 +128,7 @@ impl Desired {
 }
 
 /// Canonical failure information stored on a generation.
+#[derive(Clone)]
 pub(crate) enum FailureInfo {
     /// User plugin code returned an error.
     Plugin(String),
@@ -185,6 +186,9 @@ pub(crate) struct GenRecord {
     pub(crate) committed: bool,
     /// Children admitted under this generation have been revoked once.
     pub(crate) children_revoked: bool,
+    /// A supervised task failed the generation after (or during)
+    /// activation; teardown must land `Failed`.
+    pub(crate) forced_failure: Option<FailureInfo>,
 }
 
 impl GenRecord {
@@ -197,6 +201,7 @@ impl GenRecord {
             outcome: None,
             committed: false,
             children_revoked: false,
+            forced_failure: None,
         }
     }
 }
@@ -291,6 +296,27 @@ pub(crate) struct FiberRecord {
     pub(crate) saw_quarantined_child: bool,
     pub(crate) last_error: Option<String>,
     pub(crate) pending_reason: Option<String>,
+    /// Top-level effect entries owned directly by the generation
+    /// (registration order; teardown walks them in reverse).
+    pub(crate) entries: Vec<crate::id::EffectId>,
+    /// Every effect entry ever registered under this fiber's generations
+    /// and not yet fully disposed (for task-start scans and stats).
+    pub(crate) all_entries: Vec<crate::id::EffectId>,
+    /// Undisposed entries plus active drains (actor-maintained). While
+    /// positive, the fiber may neither land a terminal state nor start a
+    /// new generation (I03: cleanups returned first).
+    pub(crate) hold: usize,
+    /// Deferred failure landing, kept while the ledger drains.
+    pub(crate) land_failure: Option<(FailureInfo, u64)>,
+    /// Set when a drain ended with unconfirmed releases: the fiber lands
+    /// Quarantined with this report instead of Disposed.
+    pub(crate) drain_quarantine: Option<CleanupReport>,
+    /// Aggregate cleanup report of the generation drain, used for the
+    /// Disposed outcome.
+    pub(crate) drain_report: Option<CleanupReport>,
+    /// The effect entry owning this fiber, when loaded through a derived
+    /// scope.
+    pub(crate) owner_effect: Option<crate::id::EffectId>,
     /// Watch stream of the fiber's state view. The actor keeps the
     /// original receiver alive: a watch channel whose receivers are all
     /// gone is closed, and later sends would silently stop updating.
@@ -330,6 +356,13 @@ impl FiberRecord {
             saw_quarantined_child: false,
             last_error: None,
             pending_reason: None,
+            entries: Vec::new(),
+            all_entries: Vec::new(),
+            hold: 0,
+            land_failure: None,
+            drain_quarantine: None,
+            drain_report: None,
+            owner_effect: None,
             watch,
             watch_rx,
         }
@@ -371,6 +404,13 @@ impl FiberRecord {
             saw_quarantined_child: false,
             last_error: None,
             pending_reason: None,
+            entries: Vec::new(),
+            all_entries: Vec::new(),
+            hold: 0,
+            land_failure: None,
+            drain_quarantine: None,
+            drain_report: None,
+            owner_effect: None,
             watch,
             watch_rx,
         }
@@ -472,6 +512,24 @@ impl FiberRecord {
         self.resolve_dispose_ops(Arc::clone(&outcome), fx);
         self.final_outcome = Some(outcome);
         fx.terminal = Some(FiberState::Quarantined);
+    }
+
+    /// Fails the tracked generation (supervised task `Err`/panic): the
+    /// generation tears down and lands `Failed` once its ledger drained
+    /// (docs/02-api.md §6 task policy).
+    pub(crate) fn fail_generation(&mut self, info: FailureInfo) {
+        if self.state.is_terminal() {
+            return;
+        }
+        self.last_error = Some(info.display());
+        if let Some(g) = self.generation.as_mut() {
+            if g.forced_failure.is_none() {
+                g.forced_failure = Some(info);
+            }
+            g.cancelled = true;
+        } else if self.land_failure.is_none() {
+            self.land_failure = Some((info, self.desired.revision));
+        }
     }
 
     fn set_state(&mut self, state: FiberState) {
@@ -617,8 +675,9 @@ impl FiberRecord {
                 return;
             }
 
-            // Release the generation: unpublish, retire its config, land
-            // a startup failure if there was one.
+            // Release the generation: unpublish, retire its config and
+            // record the failure (if any) for a deferred landing — the
+            // effect ledger must drain before `Failed` may land.
             let mut g = self.generation.take().expect("present");
             if let Some(config) = g.config.take() {
                 fx.retire.push(Box::new(config));
@@ -627,25 +686,60 @@ impl FiberRecord {
                 self.active_generation = None;
                 self.committed_revision = None;
             }
-            if !self.desired.dispose_requested {
+            let mut failure = g.forced_failure.take();
+            if failure.is_none() {
                 if let Some(Outcome::Failed(info)) = g.outcome.take() {
+                    failure = Some(info);
+                }
+            }
+            if let Some(info) = failure {
+                if !self.desired.dispose_requested {
                     self.last_error = Some(info.display());
-                    self.set_state(FiberState::Failed);
-                    self.resolve_activation_op(
-                        g.revision,
-                        Arc::new(OperationOutcome::Failed {
-                            error: info.into_error(),
-                        }),
-                        fx,
-                    );
-                    // Failed at this exact desired/stamp: no auto retry.
-                    return;
+                    self.land_failure = Some((info, g.revision));
                 }
             }
             // Fall through to Phase B.
         }
 
         // ---- Phase B: no tracked generation; converge to desired. ----
+        // Effect-ledger barrier (I03): while entries or drains are
+        // outstanding, no terminal landing and no new generation — the
+        // previous generation's cleanups must have returned first.
+        if self.hold > 0 {
+            if matches!(
+                self.state,
+                FiberState::Starting | FiberState::Active | FiberState::Stopping
+            ) {
+                self.set_state(FiberState::Stopping);
+            }
+            return;
+        }
+        // A drain ended with unconfirmed releases: quarantine, never
+        // Disposed/Failed, never a new generation (I11/D10).
+        if let Some(report) = self.drain_quarantine.take() {
+            self.set_state(FiberState::Quarantined);
+            let outcome = Arc::new(OperationOutcome::Quarantined { cleanup: report });
+            self.resolve_dispose_ops(Arc::clone(&outcome), fx);
+            self.final_outcome = Some(outcome);
+            fx.terminal = Some(FiberState::Quarantined);
+            return;
+        }
+        // Deferred failure landing, now that the ledger drained: `Failed`
+        // asserts framework-owned resources are confirmed released.
+        if !self.desired.dispose_requested {
+            if let Some((info, revision)) = self.land_failure.take() {
+                self.set_state(FiberState::Failed);
+                self.resolve_activation_op(
+                    revision,
+                    Arc::new(OperationOutcome::Failed {
+                        error: info.into_error(),
+                    }),
+                    fx,
+                );
+                // Failed at this exact desired/stamp: no auto retry.
+                return;
+            }
+        }
         if self.desired.dispose_requested {
             // Revoke any remaining children (root's list, or stragglers of
             // a fiber without a live generation), then wait for them.
@@ -677,7 +771,7 @@ impl FiberRecord {
             }
             self.set_state(FiberState::Disposed);
             let outcome = Arc::new(OperationOutcome::Disposed {
-                cleanup: CleanupReport::default(),
+                cleanup: self.drain_report.take().unwrap_or_default(),
             });
             self.resolve_dispose_ops(Arc::clone(&outcome), fx);
             self.final_outcome = Some(outcome);
