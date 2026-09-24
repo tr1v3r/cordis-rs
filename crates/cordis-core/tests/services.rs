@@ -156,13 +156,47 @@ async fn v19_chain_scenario() {
     let cleanups: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
 
     // C provides db; B requires db and provides api; A requires api.
-    let (db_plugin, _db_ctx) = provider(
-        "db-provider",
-        db_key(),
-        Arc::new(Db {
-            url: "postgres://c".to_owned(),
-        }),
-    );
+    // C's provide is parked on a watch the test controls, with an
+    // explicit rendezvous: without it, a fast runtime can finish the
+    // whole C -> B -> A activation chain between the load admissions
+    // below and the "zero applies" assertion — a scheduling race, not a
+    // kernel guarantee (docs/07 §8: tests control the exact ordering).
+    let (c_release_tx, c_release_rx) = tokio::sync::watch::channel(0u64);
+    let (c_parked_tx, mut c_parked_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    let (db_plugin, _db_ctx) = {
+        let gate = c_release_rx.clone();
+        let parked = c_parked_tx.clone();
+        let ctx_slot = slot::<Context>();
+        let plugin = {
+            let ctx_slot = Arc::clone(&ctx_slot);
+            define("db-provider", move |ctx: Context, _cfg: Arc<Cfg>| {
+                let ctx_slot = Arc::clone(&ctx_slot);
+                let parked = parked.clone();
+                let mut gate = gate.clone();
+                let key = db_key();
+                async move {
+                    // Sample the ordinal BEFORE reporting parked: the
+                    // test only releases after seeing the report, so the
+                    // release always satisfies this wait.
+                    let target = *gate.borrow();
+                    let _ = parked.send(());
+                    gate.wait_for(|count| *count > target)
+                        .await
+                        .expect("gate lives");
+                    *ctx_slot.lock().unwrap() = Some(ctx.clone());
+                    ctx.provide(
+                        key,
+                        Arc::new(Db {
+                            url: "postgres://c".to_owned(),
+                        }),
+                    )
+                    .await?;
+                    Ok(())
+                }
+            })
+        };
+        (plugin, ctx_slot)
+    };
     let api_ctx_slot = slot::<Context>();
     let api_plugin = {
         let ctx_slot = Arc::clone(&api_ctx_slot);
@@ -232,6 +266,14 @@ async fn v19_chain_scenario() {
     let c = root.load(&db_plugin, Cfg).await.expect("c admitted");
     assert_eq!(applies.load(Ordering::SeqCst), 0);
 
+    // Release C's provide: the chain C -> B -> A converges from here.
+    // C's apply is parked at the gate (rendezvous): only now release it,
+    // and let the chain C -> B -> A converge.
+    tokio::time::timeout(Duration::from_secs(15), c_parked_rx.recv())
+        .await
+        .expect("C parks at the gate")
+        .expect("park channel lives");
+    c_release_tx.send_modify(|count| *count += 1);
     let gen_a_1 = a
         .fiber
         .wait_active(Instant::now() + Duration::from_secs(15))

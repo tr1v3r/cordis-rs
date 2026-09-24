@@ -24,10 +24,14 @@ fn deps_dir() -> PathBuf {
         .to_path_buf()
 }
 
-/// Finds `libcordis_core-*.rlib` next to the test binary.
-fn core_rlib() -> PathBuf {
+/// All `libcordis_core-*.rlib` candidates next to the test binary, newest
+/// first. Several variants coexist (unit-test, doctest and dependency
+/// profiles rebuild the crate under different metadata hashes), and a
+/// variant whose sibling dependencies were since collected can no longer
+/// load — callers must skip those instead of asserting on them.
+fn core_rlib_candidates() -> Vec<PathBuf> {
     let dir = deps_dir();
-    let candidates: Vec<PathBuf> = std::fs::read_dir(&dir)
+    let mut candidates: Vec<(std::time::SystemTime, PathBuf)> = std::fs::read_dir(&dir)
         .expect("deps dir readable")
         .filter_map(|entry| entry.ok())
         .map(|entry| entry.path())
@@ -36,22 +40,35 @@ fn core_rlib() -> PathBuf {
                 .and_then(|name| name.to_str())
                 .is_some_and(|name| name.starts_with("libcordis_core-") && name.ends_with(".rlib"))
         })
+        .filter_map(|path| {
+            let modified = std::fs::metadata(&path)
+                .and_then(|meta| meta.modified())
+                .ok()?;
+            Some((modified, path))
+        })
         .collect();
     assert!(!candidates.is_empty(), "no cordis-core rlib in {dir:?}");
-    let mut newest: Option<(std::time::SystemTime, PathBuf)> = None;
-    for candidate in candidates {
-        let modified = std::fs::metadata(&candidate)
-            .and_then(|meta| meta.modified())
-            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-        if newest.as_ref().is_none_or(|(best, _)| modified >= *best) {
-            newest = Some((modified, candidate));
-        }
-    }
-    newest.map(|(_, path)| path).expect("at least one rlib")
+    candidates.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified)); // newest first
+    candidates.into_iter().map(|(_, path)| path).collect()
+}
+
+/// Environment errors that say "this rlib candidate cannot be loaded or
+/// predates the current API" — never a verdict about the fixture itself.
+fn is_environment_error(stderr: &str) -> bool {
+    // E0463: crate not found (sibling rlibs collected).
+    // E0460/E0514: metadata version mismatch between artifacts.
+    // E0432/E0433: unresolved import — a stale crate predating the API
+    // the fixture exercises.
+    stderr.contains("error[E0463]")
+        || stderr.contains("error[E0460]")
+        || stderr.contains("error[E0514]")
+        || stderr.contains("error[E0432]")
+        || stderr.contains("error[E0433]")
 }
 
 /// Compiles `fixture` (a complete crate source) against cordis-core and
-/// returns the collected stderr; the compilation must fail.
+/// returns the collected stderr; the compilation must fail for a
+/// type-system reason, not for an unloadable-environment reason.
 fn compile_fail(fixture: &str) -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -64,25 +81,39 @@ fn compile_fail(fixture: &str) -> String {
     let source = out_dir.join("fixture.rs");
     std::fs::write(&source, fixture).expect("write fixture");
 
-    let status_output = Command::new("rustc")
-        .arg("--edition=2024")
-        .arg("--crate-type=lib")
-        .arg("--emit=metadata")
-        .arg("-o")
-        .arg(out_dir.join("fixture.rmeta"))
-        .arg("--extern")
-        .arg(format!("cordis_core={}", core_rlib().display()))
-        .arg("-L")
-        .arg(format!("dependency={}", deps_dir().display()))
-        .arg(&source)
-        .output()
-        .expect("rustc runs");
-
-    assert!(
-        !status_output.status.success(),
-        "fixture must fail to compile:\\n--- source ---\\n{fixture}\\n--- it compiled, but must not ---"
+    // Newest-first over the rlib variants: the newest *loadable* one is
+    // deterministic; stale variants are skipped by their environment
+    // errors instead of failing the assertion.
+    let mut last_environment_error = String::new();
+    for rlib in core_rlib_candidates() {
+        let output = Command::new("rustc")
+            .arg("--edition=2024")
+            .arg("--crate-type=lib")
+            .arg("--emit=metadata")
+            .arg("-o")
+            .arg(out_dir.join("fixture.rmeta"))
+            .arg("--extern")
+            .arg(format!("cordis_core={}", rlib.display()))
+            .arg("-L")
+            .arg(format!("dependency={}", deps_dir().display()))
+            .arg(&source)
+            .output()
+            .expect("rustc runs");
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        if is_environment_error(&stderr) {
+            last_environment_error = stderr;
+            continue;
+        }
+        assert!(
+            !output.status.success(),
+            "fixture must fail to compile:\n--- source ---\n{fixture}\n--- it compiled, but must not ---"
+        );
+        return stderr;
+    }
+    panic!(
+        "no loadable cordis-core rlib variant for the fixture; \
+         last environment error:\n{last_environment_error}"
     );
-    String::from_utf8_lossy(&status_output.stderr).into_owned()
 }
 
 /// A short stable id for a fixture (first type name found, else a hash).
@@ -193,7 +224,7 @@ fn v31_compile_fail_next_run_twice() {
     let stderr = compile_fail(NEXT_TWICE);
     assert!(
         stderr.contains("error[E0382]") && stderr.contains("use of moved value"),
-        "expected a use-after-move error, got:\\n{stderr}"
+        "expected a use-after-move error, got:\n{stderr}"
     );
 }
 
