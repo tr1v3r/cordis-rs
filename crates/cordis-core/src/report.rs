@@ -1,10 +1,10 @@
 //! Draft report and outcome types for lifecycle operations.
 //!
-//! These types fix the shape of completion reporting now (P1) so later
-//! phases fill them in without churning the public surface:
+//! These types fix the shape of completion reporting so later phases fill
+//! them in without churning the public surface:
 //!
-//! - [`OperationOutcome`] is what an operation receipt resolves to once the
-//!   coordinator exists (P2).
+//! - [`OperationOutcome`] is what an operation receipt resolves to; the
+//!   P2 coordinator produces it for load/update/restart/dispose.
 //! - [`CleanupReport`] aggregates effect/resource cleanup results (P3):
 //!   one failing disposer never skips the remaining independent resources.
 //! - [`ShutdownOptions`] parameterizes [`App::shutdown`](crate::App::shutdown).
@@ -90,20 +90,42 @@ impl CleanupReport {
 
 /// Options for [`App::shutdown`](crate::App::shutdown).
 ///
-/// Draft: an empty extension point for now; timeouts and teardown policies
-/// attach here in later phases without changing the shutdown signature.
+/// `timeout` bounds the overall shutdown wait: how long the root teardown
+/// may wait for every fiber to reach a terminal state and for every
+/// supervised worker to be joined. `None` (the default) waits indefinitely
+/// — cooperative fibers always settle. Hosts that cannot afford an
+/// unbounded hang must pass an explicit deadline; when it passes, workers
+/// that have not exited leave their fibers [`Quarantined`] instead of
+/// being reported as disposed (docs/03-runtime.md §8: a deadline is a
+/// fact about time, not about work having stopped).
+///
+/// [`Quarantined`]: crate::FiberState::Quarantined
 #[derive(Debug, Clone, Copy, Default)]
-pub struct ShutdownOptions {}
+pub struct ShutdownOptions {
+    /// Overall shutdown deadline as a duration from the moment shutdown is
+    /// accepted.
+    pub timeout: Option<std::time::Duration>,
+}
 
 /// Report returned by [`App::shutdown`](crate::App::shutdown).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShutdownReport {
-    /// Number of registered fibers covered by this shutdown. In the P1
-    /// skeleton fibers carry no running state, so disposal needs no awaited
-    /// cleanup; generation teardown arrives with the P2 coordinator.
+    /// Number of fibers that reached `Disposed` during this shutdown.
+    ///
+    /// User fibers only — the internal root fiber is not counted. Fibers
+    /// that could not confirm release are counted in
+    /// [`quarantined`](Self::quarantined) instead, never here.
     pub fibers_disposed: usize,
-    /// Number of plugin runtimes dropped from the registry.
+    /// Number of plugin runtimes dropped from the registry during this
+    /// shutdown (a runtime is dropped once its last fiber and its pending
+    /// admissions are gone).
     pub runtimes_dropped: usize,
+    /// Number of fibers that ended this shutdown [`Quarantined`]: they or
+    /// their descendants still had supervised work that had not exited
+    /// when the shutdown deadline passed. This is not a success count.
+    ///
+    /// [`Quarantined`]: crate::FiberState::Quarantined
+    pub quarantined: usize,
 }
 
 #[cfg(test)]

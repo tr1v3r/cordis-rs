@@ -86,6 +86,30 @@ pub enum Error {
         /// What could not be released, and why.
         reason: String,
     },
+    /// An admission limit (mailbox backlog, live fibers, live workers) was
+    /// reached; the request was refused instead of being silently queued
+    /// without bound (docs/03-runtime.md I13).
+    CapacityExceeded {
+        /// Which limit was hit and its size.
+        reason: String,
+    },
+    /// A supervised worker crossed its panic boundary: the factory that
+    /// constructs the activation future, or the future itself, panicked.
+    /// The panic is recorded as a failure of the owning fiber; the
+    /// coordinator itself keeps running.
+    WorkerPanicked {
+        /// Where the panic crossed the boundary (factory or poll).
+        context: String,
+        /// The panic payload rendered as a message when possible.
+        message: String,
+    },
+    /// A deadline passed before the awaited state was reached. The deadline
+    /// says nothing about whether the underlying work eventually finished
+    /// (docs/03-runtime.md §8).
+    DeadlineExceeded {
+        /// What was being waited for.
+        reason: String,
+    },
 }
 
 impl fmt::Display for Error {
@@ -128,6 +152,15 @@ impl fmt::Display for Error {
                     f,
                     "resources could not be released and are quarantined: {reason}"
                 )
+            }
+            Error::CapacityExceeded { reason } => {
+                write!(f, "an admission limit was reached: {reason}")
+            }
+            Error::WorkerPanicked { context, message } => {
+                write!(f, "a supervised worker panicked in {context}: {message}")
+            }
+            Error::DeadlineExceeded { reason } => {
+                write!(f, "a deadline passed before {reason}")
             }
         }
     }

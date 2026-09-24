@@ -11,91 +11,115 @@
 //! ## Implemented so far
 //!
 //! This crate is under construction in the phases of
-//! `docs/06-implementation-plan.md`. The **identity and error layer (P1)**
-//! is in place: id newtypes, the framework error taxonomy, draft
-//! completion-report types, the [`App`]/[`Context`] skeleton with explicit
-//! shutdown, and typed plugin definitions whose clone preserves identity.
-//! Activation, effects, services and events (P2–P5) attach to these seams.
+//! `docs/06-implementation-plan.md`. In place are:
+//!
+//! - the **identity and error layer (P1)**: id newtypes, the framework
+//!   error taxonomy, the [`App`]/[`Context`] skeleton with explicit
+//!   shutdown, and typed plugin definitions whose clone preserves
+//!   identity;
+//! - the **serial coordinator and lifecycle state machine (P2)**: a
+//!   single actor per app owns lifecycle decisions; bounded external
+//!   mailbox plus a separate completion lane; activation workers with
+//!   panic boundaries supervised through joined handles; per-generation
+//!   tokens with stale-completion verification; desired-revision
+//!   latest-wins with operation receipts; callback-origin deadlock
+//!   refusal; root shutdown with quarantine reporting.
+//!
+//! Effects, services and events (P3–P5) attach to these seams.
 //!
 //! ## Boundaries
 //!
-//! - no default dependency on `serde`, `wasmtime` or `notify` (this crate
-//!   currently has zero dependencies);
-//! - safe Rust only: `#![forbid(unsafe_code)]` and the workspace lint table
-//!   reject `unsafe` blocks;
+//! - no dependency on `serde`, `wasmtime` or `notify`; Tokio is the one
+//!   runtime substrate (docs/08-decisions.md D01/D03);
+//! - safe Rust only: `#![forbid(unsafe_code)]`;
 //! - ids, errors, `Debug` output and reports never contain configuration
-//!   payloads, so they are safe to log.
+//!   payloads, so they are safe to log;
+//! - the coordinator never executes user apply/cleanup/handler code
+//!   (docs/03-runtime.md I02).
 //!
 //! ## Minimal usage
 //!
-//! Build an app, define a plugin, load fibers of it, then shut the app down
-//! explicitly. Loading the same definition twice shares one runtime and
-//! yields two fibers with independent configurations (V01); defining twice
-//! creates two independent definitions even with the same name (V02).
-//!
-//! The example uses a tiny inline `block_on` so it stays runnable without
-//! dragging an executor dependency into the crate; real hosts pick their
-//! own runtime.
+//! Build an app inside a Tokio runtime, define a plugin, load fibers of
+//! it, await the activation receipt, then shut the app down explicitly.
+//! Loading the same definition twice shares one runtime and yields two
+//! fibers with independent configurations (V01); defining twice creates
+//! two independent definitions even with the same name (V02).
 //!
 //! ```
-//! use cordis_core::{define, App, ShutdownOptions};
-//! use std::sync::Arc;
+//! use cordis_core::{define, App, FiberState, ShutdownOptions};
+//! use std::time::{Duration, Instant};
 //!
-//! # fn block_on<F: std::future::Future>(fut: F) -> F::Output {
-//! #     use std::task::Poll;
-//! #     let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
-//! #     let mut fut = std::pin::pin!(fut);
-//! #     loop {
-//! #         match fut.as_mut().poll(&mut cx) {
-//! #             Poll::Ready(out) => return out,
-//! #             Poll::Pending => std::thread::yield_now(),
-//! #         }
-//! #     }
-//! # }
 //! struct MetricsConfig {
 //!     endpoint: String,
 //! }
 //!
-//! let app = App::builder().name("host").build().expect("app builds");
-//! let root = app.context();
+//! # fn main() {
+//! let rt = tokio::runtime::Builder::new_current_thread()
+//!     .enable_all()
+//!     .build()
+//!     .expect("runtime builds");
+//! rt.block_on(async {
+//!     let app = App::builder().name("host").build().expect("app builds");
+//!     let root = app.context();
 //!
-//! let plugin = define("metrics", |_ctx, _cfg: Arc<MetricsConfig>| async {
-//!     // Registers services, events and cleanup through the context of
-//!     // this generation once the lifecycle exists (P2+).
-//!     Ok(())
+//!     let plugin = define("metrics", |_ctx, cfg: std::sync::Arc<MetricsConfig>| async move {
+//!         // Registers services, events and cleanup through the context of
+//!         // this generation once the lifecycle exists (P3+).
+//!         assert!(!cfg.endpoint.is_empty());
+//!         Ok(())
+//!     });
+//!
+//!     // Admitted, then activated: two fibers of one definition share the
+//!     // runtime and keep independent configurations.
+//!     let first = root
+//!         .load(&plugin, MetricsConfig { endpoint: "a".into() })
+//!         .await
+//!         .expect("first load");
+//!     let second = root
+//!         .load(&plugin.clone(), MetricsConfig { endpoint: "b".into() })
+//!         .await
+//!         .expect("second load");
+//!     assert_eq!(first.fiber.runtime_id(), second.fiber.runtime_id());
+//!     assert_ne!(first.fiber.fiber_id(), second.fiber.fiber_id());
+//!
+//!     // The load receipt resolves when this activation request settles.
+//!     let outcome = first.operation.wait().await.expect("no deadlock");
+//!     assert!(matches!(&*outcome, cordis_core::OperationOutcome::Active { .. }));
+//!     assert_eq!(
+//!         second.fiber.status().await.expect("alive").state,
+//!         FiberState::Active
+//!     );
+//!
+//!     // Explicit, awaited, observable shutdown. Dropping the app instead
+//!     // is only a best-effort close — see the docs on `App`.
+//!     let report = app
+//!         .shutdown(ShutdownOptions { timeout: Some(Duration::from_secs(5)) })
+//!         .await
+//!         .expect("shutdown completes");
+//!     assert_eq!(report.fibers_disposed, 2);
+//!     assert_eq!(report.runtimes_dropped, 1);
 //! });
-//!
-//! // Same definition, two loads: one runtime, two fibers, independent
-//! // configurations.
-//! let first = block_on(root.load(&plugin, MetricsConfig { endpoint: "a".into() }))
-//!     .expect("first load");
-//! let second = block_on(root.load(&plugin.clone(), MetricsConfig { endpoint: "b".into() }))
-//!     .expect("second load");
-//! assert_eq!(first.runtime_id(), second.runtime_id());
-//! assert_ne!(first.fiber_id(), second.fiber_id());
-//! assert_eq!(first.config().unwrap().endpoint, "a");
-//! assert_eq!(second.config().unwrap().endpoint, "b");
-//!
-//! // Explicit, awaited, observable shutdown. Dropping the app instead is
-//! // only a best-effort close — see the docs on `App`.
-//! let report = block_on(app.shutdown(ShutdownOptions::default()));
-//! assert_eq!(report.fibers_disposed, 2);
-//! assert_eq!(report.runtimes_dropped, 1);
+//! # }
 //! ```
 
 #![forbid(unsafe_code)]
 
 mod app;
 mod context;
+mod coordinator;
 mod error;
 mod id;
+mod machine;
 mod plugin;
 mod report;
 
 pub use app::{App, AppBuilder, WeakApp};
-pub use context::{Context, FiberHandle};
+pub use context::{Context, ErasedFiberHandle, FiberHandle, LoadReceipt};
+pub use coordinator::KernelStats;
+pub use coordinator::operation::Operation;
 pub use error::{CleanupError, Error, PluginError};
 pub use id::{BindingId, DefinitionId, EffectId, FiberId, GenerationId, OperationId, RuntimeId};
+pub use machine::{FiberState, FiberStatus, FiberView};
 pub use plugin::{Plugin, define};
 pub use report::{
     CleanupFailure, CleanupReport, OperationOutcome, ShutdownOptions, ShutdownReport,
@@ -107,35 +131,10 @@ pub use report::{
 pub const SCAFFOLD_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[cfg(test)]
-pub(crate) mod test_util {
-    //! Test-only helpers shared by the crate's unit tests.
-
-    use std::future::Future;
-    use std::task::{Context, Poll};
-
-    /// Drives `fut` to completion on the current thread.
-    ///
-    /// The futures produced by the P1 skeleton are always immediately
-    /// ready, so a no-op waker plus cooperative yielding suffices and keeps
-    /// the crate free of any executor dependency. Replace with a real
-    /// runtime once the coordinator introduces genuine suspension (P2).
-    pub(crate) fn block_on<F: Future>(fut: F) -> F::Output {
-        let mut cx = Context::from_waker(std::task::Waker::noop());
-        let mut fut = std::pin::pin!(fut);
-        loop {
-            match fut.as_mut().poll(&mut cx) {
-                Poll::Ready(out) => return out,
-                Poll::Pending => std::thread::yield_now(),
-            }
-        }
-    }
-}
-
-#[cfg(test)]
 mod tests {
-    use super::test_util::block_on;
-    use super::{App, Error, Plugin, ShutdownOptions, define};
+    use super::{App, Error, FiberState, Plugin, ShutdownOptions, define};
     use std::sync::Arc;
+    use std::time::Duration;
 
     struct Config {
         secret: String,
@@ -151,26 +150,32 @@ mod tests {
         }
     }
 
-    #[test]
-    fn v01_same_definition_two_loads_share_one_runtime() {
+    #[tokio::test]
+    async fn v01_same_definition_two_loads_share_one_runtime() {
         let app = App::builder().build().unwrap();
         let root = app.context();
         let plugin = plugin();
 
-        let first = block_on(root.load(&plugin, config("alpha-secret"))).unwrap();
-        let second = block_on(root.load(&plugin.clone(), config("beta-secret"))).unwrap();
+        let first = root.load(&plugin, config("alpha-secret")).await.unwrap();
+        let second = root
+            .load(&plugin.clone(), config("beta-secret"))
+            .await
+            .unwrap();
 
         // One runtime (same definition), two fibers (two loads).
-        assert_eq!(first.runtime_id(), second.runtime_id());
-        assert_ne!(first.fiber_id(), second.fiber_id());
+        assert_eq!(first.fiber.runtime_id(), second.fiber.runtime_id());
+        assert_ne!(first.fiber.fiber_id(), second.fiber.fiber_id());
 
-        // Configurations are per-fiber and independent.
-        assert_eq!(first.config().unwrap().secret, "alpha-secret");
-        assert_eq!(second.config().unwrap().secret, "beta-secret");
+        // Configurations are per-fiber and independent (desired state).
+        assert_eq!(first.fiber.config().await.unwrap().secret, "alpha-secret");
+        assert_eq!(second.fiber.config().await.unwrap().secret, "beta-secret");
+
+        first.operation.wait().await.unwrap();
+        second.operation.wait().await.unwrap();
     }
 
-    #[test]
-    fn v02_same_name_separate_definitions_get_separate_runtimes() {
+    #[tokio::test]
+    async fn v02_same_name_separate_definitions_get_separate_runtimes() {
         let app = App::builder().build().unwrap();
         let root = app.context();
 
@@ -179,87 +184,100 @@ mod tests {
         assert_eq!(first.name(), second.name());
         assert_ne!(first.definition_id(), second.definition_id());
 
-        let handle_a = block_on(root.load(&first, config("a"))).unwrap();
-        let handle_b = block_on(root.load(&second, config("b"))).unwrap();
+        let handle_a = root.load(&first, config("a")).await.unwrap();
+        let handle_b = root.load(&second, config("b")).await.unwrap();
 
         // Two runtimes, two fibers: same-name definitions never merge.
-        assert_ne!(handle_a.runtime_id(), handle_b.runtime_id());
-        assert_ne!(handle_a.fiber_id(), handle_b.fiber_id());
+        assert_ne!(handle_a.fiber.runtime_id(), handle_b.fiber.runtime_id());
+        assert_ne!(handle_a.fiber.fiber_id(), handle_b.fiber.fiber_id());
 
-        let report = block_on(app.shutdown(ShutdownOptions::default()));
+        handle_a.operation.wait().await.unwrap();
+        handle_b.operation.wait().await.unwrap();
+
+        let report = app
+            .shutdown(ShutdownOptions {
+                timeout: Some(Duration::from_secs(5)),
+            })
+            .await
+            .unwrap();
         assert_eq!(report.runtimes_dropped, 2);
     }
 
-    #[test]
-    fn v03_apps_are_isolated() {
+    #[tokio::test]
+    async fn v03_apps_are_isolated() {
         let app_a = App::builder().name("a").build().unwrap();
         let app_b = App::builder().name("b").build().unwrap();
         let plugin = plugin();
 
         // The same definition loaded into two apps creates one runtime per
         // app; ids and state never cross apps.
-        let handle_a = block_on(app_a.context().load(&plugin, config("a"))).unwrap();
-        let handle_b = block_on(app_b.context().load(&plugin, config("b"))).unwrap();
-        assert_ne!(handle_a.runtime_id(), handle_b.runtime_id());
+        let handle_a = app_a.context().load(&plugin, config("a")).await.unwrap();
+        let handle_b = app_b.context().load(&plugin, config("b")).await.unwrap();
+        assert_ne!(handle_a.fiber.runtime_id(), handle_b.fiber.runtime_id());
 
         // Shutting down B leaves A untouched.
-        let report_b = block_on(app_b.shutdown(ShutdownOptions::default()));
+        let report_b = app_b.shutdown(ShutdownOptions::default()).await.unwrap();
         assert_eq!(report_b.fibers_disposed, 1);
         assert!(app_b.is_closed());
         assert!(!app_a.is_closed());
-        assert!(handle_a.config().is_ok());
+        handle_a.operation.wait().await.unwrap();
+        assert!(handle_a.fiber.config().await.is_ok());
     }
 
-    #[test]
-    fn v03_dropping_views_and_handles_does_not_unload() {
+    #[tokio::test]
+    async fn v03_dropping_views_and_handles_does_not_unload() {
         let app = App::builder().build().unwrap();
         let plugin = plugin();
 
         {
             let root = app.context();
-            let _handle_first = block_on(root.load(&plugin, config("a"))).unwrap();
-            let _handle_second = block_on(root.load(&plugin.clone(), config("b"))).unwrap();
+            let _receipt_first = root.load(&plugin, config("a")).await.unwrap();
+            let _receipt_second = root.load(&plugin.clone(), config("b")).await.unwrap();
             let _more_views = (root.clone(), root.clone());
         } // contexts and fiber handles dropped here
 
         // The app still owns both fibers; shutdown is what disposes them.
-        let report = block_on(app.shutdown(ShutdownOptions::default()));
+        let report = app.shutdown(ShutdownOptions::default()).await.unwrap();
         assert_eq!(report.fibers_disposed, 2);
         assert_eq!(report.runtimes_dropped, 1);
     }
 
-    #[test]
-    fn shutdown_is_explicit_final_and_idempotent() {
+    #[tokio::test]
+    async fn shutdown_is_explicit_final_and_idempotent() {
         let app = App::builder().build().unwrap();
         let root = app.context();
         let plugin = plugin();
 
-        let handle = block_on(root.load(&plugin, config("secret-value"))).unwrap();
-        let report = block_on(app.shutdown(ShutdownOptions::default()));
+        let receipt = root.load(&plugin, config("secret-value")).await.unwrap();
+        receipt.operation.wait().await.unwrap();
+        let report = app.shutdown(ShutdownOptions::default()).await.unwrap();
         assert_eq!(report.fibers_disposed, 1);
         assert_eq!(report.runtimes_dropped, 1);
         assert!(app.is_closed());
 
         // Post-shutdown admission and reads are refused, never re-routed.
         assert!(matches!(
-            block_on(root.load(&plugin, config("late"))),
+            root.load(&plugin, config("late")).await,
             Err(Error::HostClosed)
         ));
-        assert!(matches!(handle.config(), Err(Error::HostClosed)));
+        assert!(matches!(
+            receipt.fiber.config().await,
+            Err(Error::HostClosed)
+        ));
 
         // A second shutdown observes the same completed report.
-        let replay = block_on(app.shutdown(ShutdownOptions::default()));
+        let replay = app.shutdown(ShutdownOptions::default()).await.unwrap();
         assert_eq!(replay, report);
     }
 
-    #[test]
-    fn weak_handles_track_only_the_app_lifetime() {
+    #[tokio::test]
+    async fn weak_handles_track_only_the_app_lifetime() {
         let app = App::builder().build().unwrap();
         let weak = app.downgrade();
         assert!(weak.upgrade().is_some());
 
         // Shutdown closes the app but the host still holds it.
-        let report = block_on(app.shutdown(ShutdownOptions::default()));
+        let report = app.shutdown(ShutdownOptions::default()).await.unwrap();
         assert_eq!(report.fibers_disposed, 0);
         assert!(weak.upgrade().is_some());
 
@@ -267,32 +285,53 @@ mod tests {
         assert!(weak.upgrade().is_none());
     }
 
-    #[test]
-    fn builder_rejects_blank_names() {
+    #[tokio::test]
+    async fn builder_rejects_blank_names() {
         let err = App::builder().name("   ").build().unwrap_err();
         assert!(matches!(err, Error::InvalidConfig { .. }));
     }
 
-    #[test]
-    fn debug_and_display_outputs_never_contain_configuration_values() {
+    #[tokio::test]
+    async fn debug_and_display_outputs_never_contain_configuration_values() {
         let app = App::builder().name("diag").build().unwrap();
         let root = app.context();
         let plugin = plugin();
 
-        let handle = block_on(root.load(&plugin, config("s3cr3t-config-value"))).unwrap();
+        let receipt = root
+            .load(&plugin, config("s3cr3t-config-value"))
+            .await
+            .unwrap();
 
         for text in [
-            format!("{handle:?}"),
+            format!("{:?}", receipt.fiber),
             format!("{plugin:?}"),
             format!("{app:?}"),
             format!("{root:?}"),
+            format!("{:?}", receipt.operation),
         ] {
             assert!(!text.contains("s3cr3t-config-value"), "leaked in: {text}");
         }
-        assert!(format!("{handle:?}").contains("FiberId("));
+        assert!(format!("{:?}", receipt.fiber).contains("FiberId("));
 
         // Errors describe reasons, never configuration payloads.
         let err = App::builder().name("").build().unwrap_err();
-        assert!(!format!("{err}").contains("s3cr3t-config-value"));
+        assert!(!err.to_string().contains("s3cr3t-config-value"));
+    }
+
+    #[tokio::test]
+    async fn states_reach_active_and_dispose_through_receipts() {
+        // Smallest P2 end-to-end: load -> active -> dispose.
+        let app = App::builder().build().unwrap();
+        let receipt = app.context().load(&plugin(), config("x")).await.unwrap();
+        assert_eq!(
+            receipt.fiber.status().await.unwrap().state,
+            FiberState::Active
+        );
+        let dispose = receipt.fiber.dispose().await.unwrap();
+        dispose.wait().await.unwrap();
+        assert_eq!(
+            receipt.fiber.status().await.unwrap().state,
+            FiberState::Disposed
+        );
     }
 }

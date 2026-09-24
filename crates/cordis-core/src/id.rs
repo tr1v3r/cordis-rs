@@ -21,6 +21,10 @@ static NEXT_DEFINITION_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_RUNTIME_ID: AtomicU64 = AtomicU64::new(1);
 /// Global allocator for fiber identities.
 static NEXT_FIBER_ID: AtomicU64 = AtomicU64::new(1);
+/// Global allocator for generation identities.
+static NEXT_GENERATION_ID: AtomicU64 = AtomicU64::new(1);
+/// Global allocator for operation identities.
+static NEXT_OPERATION_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Declares an id newtype over a `u64` counter value.
 ///
@@ -110,6 +114,12 @@ impl DefinitionId {
     }
 }
 
+/// Definition identity reserved for the app's internal root fiber
+/// (docs/03-runtime.md §9). The root runs no plugin code; the reserved id
+/// only keeps its records shaped like every other fiber. It can never
+/// collide with user definitions because the global allocator starts at 1.
+pub(crate) const ROOT_DEFINITION_ID: DefinitionId = DefinitionId(0);
+
 impl RuntimeId {
     /// Allocates the next process-global runtime identity.
     pub(crate) fn alloc_global() -> Self {
@@ -121,6 +131,26 @@ impl FiberId {
     /// Allocates the next process-global fiber identity.
     pub(crate) fn alloc_global() -> Self {
         Self(NEXT_FIBER_ID.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
+impl GenerationId {
+    /// Allocates the next process-global generation identity.
+    ///
+    /// Called by the coordinator when it assigns a new generation to a
+    /// fiber; generation tokens handed to workers always originate here.
+    pub(crate) fn alloc_global() -> Self {
+        Self(NEXT_GENERATION_ID.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
+impl OperationId {
+    /// Allocates the next process-global operation identity.
+    ///
+    /// Called by the coordinator when it admits a lifecycle command and
+    /// issues the operation receipt returned to the caller.
+    pub(crate) fn alloc_global() -> Self {
+        Self(NEXT_OPERATION_ID.fetch_add(1, Ordering::Relaxed))
     }
 }
 

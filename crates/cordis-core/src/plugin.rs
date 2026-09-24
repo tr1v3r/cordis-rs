@@ -90,6 +90,14 @@ impl<C> Plugin<C> {
     pub fn definition_id(&self) -> DefinitionId {
         self.erased.meta().definition_id
     }
+
+    /// Returns the erased definition behind the typed facade.
+    ///
+    /// Crate-internal: the coordinator captures this to spawn activation
+    /// workers; the public surface stays typed.
+    pub(crate) fn erased_clone(&self) -> Arc<dyn ErasedPlugin> {
+        Arc::clone(&self.erased)
+    }
 }
 
 /// Defines a plugin: an immutable definition identified by a fresh
@@ -166,7 +174,6 @@ where
 mod tests {
     use super::*;
     use crate::app::App;
-    use crate::test_util::block_on;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -191,8 +198,8 @@ mod tests {
         assert_ne!(first.definition_id(), second.definition_id());
     }
 
-    #[test]
-    fn erased_boundary_type_checks_and_activates() {
+    #[tokio::test]
+    async fn erased_boundary_type_checks_and_activates() {
         let app = App::builder().build().unwrap();
         let activations = Arc::new(AtomicUsize::new(0));
         let seen_values = Arc::new(Mutex::new(Vec::new()));
@@ -214,15 +221,16 @@ mod tests {
 
         // Correct type: the typed apply runs and observes the config.
         let ctx = app.context();
-        let outcome =
-            block_on(Arc::clone(&plugin.erased).activate(ctx, Arc::new(Config { value: 7 })));
+        let outcome = Arc::clone(&plugin.erased)
+            .activate(ctx, Arc::new(Config { value: 7 }))
+            .await;
         assert!(outcome.is_ok());
 
         // Wrong type: rejected in a controlled way, apply never runs (the
         // runtime half of V40).
         let ctx = app.context();
         let wrong_type: AnyConfig = Arc::new(String::from("not a Config"));
-        let rejected = block_on(Arc::clone(&plugin.erased).activate(ctx, wrong_type));
+        let rejected = Arc::clone(&plugin.erased).activate(ctx, wrong_type).await;
         assert!(rejected.is_err());
 
         assert_eq!(activations.load(Ordering::SeqCst), 1);

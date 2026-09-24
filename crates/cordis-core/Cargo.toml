@@ -1,6 +1,6 @@
 [package]
 name = "cordis-core"
-description = "Kernel of cordis-rs: coordinator, effect scopes, service bindings and events."
+description = "Kernel of cordis-rs: coordinator, effect bindings and events."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,10 +8,31 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 
-# Intentionally empty: cordis-core must build with no default dependencies —
-# in particular no serde, wasmtime or notify (see AGENTS.md boundaries).
-# Optional extensions go behind explicit feature flags in later phases.
+# cordis-core deliberately keeps its dependency surface minimal (no serde,
+# wasmtime or notify; see AGENTS.md boundaries). Tokio is the one runtime
+# substrate the design locks in (docs/08-decisions.md D01/D03): the
+# coordinator's bounded mailboxes, supervised workers and JoinHandle
+# semantics are specified against it. Only the executor-facing features are
+# enabled — no I/O driver, no network stack. Exact versions are pinned by
+# the workspace Cargo.lock (docs/08-decisions.md, "lock actual versions").
 [dependencies]
+tokio = { version = "1.53", default-features = false, features = [
+    "rt",
+    "sync",
+    "time",
+    "macros",
+] }
+
+[dev-dependencies]
+# Tests exercise the coordinator on both scheduler flavors required by
+# docs/07-validation.md §8 (current_thread and multi_thread).
+tokio = { version = "1.53", default-features = false, features = [
+    "rt",
+    "rt-multi-thread",
+    "sync",
+    "time",
+    "macros",
+] }
 
 [lints]
 workspace = true

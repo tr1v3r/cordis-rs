@@ -1,13 +1,14 @@
 //! The host-side application: builder, weak handles, explicit shutdown.
 
-use std::collections::HashMap;
-use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
+use tokio::sync::{mpsc, oneshot};
+
 use crate::context::Context;
+use crate::coordinator::{Command, CommandSender, KernelStats, Limits, RetireLane};
 use crate::error::Error;
-use crate::id::{DefinitionId, FiberId, RuntimeId};
-use crate::plugin::AnyConfig;
+use crate::id::{FiberId, GenerationId};
 use crate::report::{ShutdownOptions, ShutdownReport};
 
 /// The host application: the owner of all plugin runtime state.
@@ -17,14 +18,18 @@ use crate::report::{ShutdownOptions, ShutdownReport};
 /// [`FiberHandle`](crate::FiberHandle) keep only weak references, so they
 /// never prolong the app's lifetime.
 ///
+/// Building an `App` spawns the coordinator actor on the current Tokio
+/// runtime; an `App` must therefore be created (and shutdown awaited)
+/// inside a runtime context.
+///
 /// ## Shutdown contract
 ///
 /// [`App::shutdown`] is the explicit, awaited, observable teardown path:
-/// it returns a [`ShutdownReport`] after the registry has been closed.
-/// [`Drop`] is a **best-effort safety net only**: it refuses further
-/// admissions but performs no async cleanup, never blocks, and does not
-/// promise that any cleanup completed. Hosts that care about teardown
-/// observability must call `shutdown().await` before dropping the app.
+/// it returns a [`ShutdownReport`] after the whole fiber tree reached a
+/// terminal state and every supervised worker was joined. [`Drop`] is a
+/// **best-effort safety net only**: it refuses further admissions and
+/// aborts workers but performs no awaited cleanup and promises nothing
+/// about resources that would have needed awaited disposal.
 pub struct App {
     inner: Arc<AppInner>,
 }
@@ -33,7 +38,7 @@ pub struct App {
 ///
 /// Upgrading succeeds only while the host still holds the app. Useful for
 /// caches and diagnostics that must not keep the app alive.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct WeakApp {
     inner: Weak<AppInner>,
 }
@@ -46,17 +51,28 @@ impl WeakApp {
     }
 }
 
+impl std::fmt::Debug for WeakApp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WeakApp")
+            .field("alive", &self.inner.upgrade().is_some())
+            .finish()
+    }
+}
+
 /// Builder for [`App`].
 #[derive(Debug, Clone)]
 pub struct AppBuilder {
     name: String,
+    limits: Limits,
 }
 
 impl AppBuilder {
-    /// Creates a builder with the default app name.
+    /// Creates a builder with the default app name and default admission
+    /// limits.
     pub fn new() -> Self {
         Self {
             name: "cordis-app".to_owned(),
+            limits: Limits::default(),
         }
     }
 
@@ -66,7 +82,29 @@ impl AppBuilder {
         self
     }
 
-    /// Builds the app.
+    /// Sets the capacity of the bounded external command mailbox.
+    ///
+    /// Submission APIs await capacity instead of dropping commands
+    /// (docs/03-runtime.md §4.2).
+    pub fn mailbox_capacity(mut self, capacity: usize) -> Self {
+        self.limits.mailbox_capacity = capacity;
+        self
+    }
+
+    /// Sets the maximum number of simultaneously live (non-terminal)
+    /// fibers.
+    pub fn max_fibers(mut self, max: usize) -> Self {
+        self.limits.max_fibers = max;
+        self
+    }
+
+    /// Sets the maximum number of simultaneously live activation workers.
+    pub fn max_workers(mut self, max: usize) -> Self {
+        self.limits.max_workers = max;
+        self
+    }
+
+    /// Builds the app and spawns its coordinator on the current runtime.
     ///
     /// Fails with [`Error::InvalidConfig`] if the name is empty or only
     /// whitespace.
@@ -76,9 +114,26 @@ impl AppBuilder {
                 reason: "app name must not be empty".to_owned(),
             });
         }
-        Ok(App {
-            inner: Arc::new(AppInner::new(self.name)),
-        })
+        let (external_tx, external_rx) = mpsc::channel::<Command>(self.limits.mailbox_capacity);
+        let inner = Arc::new(AppInner {
+            name: self.name,
+            tx: external_tx,
+            closed: AtomicBool::new(false),
+            report: Mutex::new(None),
+        });
+
+        let root = FiberId::alloc_global();
+        let root_generation = GenerationId::alloc_global();
+        let coordinator = crate::coordinator::Coordinator::new(
+            Arc::downgrade(&inner),
+            external_rx,
+            RetireLane::spawn(),
+            root,
+            root_generation,
+            self.limits,
+        );
+        tokio::spawn(coordinator.run());
+        Ok(App { inner })
     }
 }
 
@@ -112,48 +167,54 @@ impl App {
     /// Returns `true` once shutdown (or the best-effort drop path) closed
     /// this app.
     pub fn is_closed(&self) -> bool {
-        self.inner.lock_state().closed
+        self.inner.closed.load(Ordering::Acquire)
+    }
+
+    /// Returns a snapshot of kernel-wide counters (ids and counts only).
+    ///
+    /// Fails with [`Error::HostClosed`] once the app is closed.
+    pub async fn stats(&self) -> Result<KernelStats, Error> {
+        self.inner.submit(|reply| Command::Stats { reply }).await
     }
 
     /// Explicitly shuts the app down and returns the completion report.
     ///
-    /// After this call every context and handle of this app refuses work
-    /// with [`Error::HostClosed`]. Calling shutdown again is idempotent and
-    /// replays the same report: every caller observes one completed
-    /// shutdown, not a second teardown.
+    /// This disposes the whole fiber tree from the root, waits for every
+    /// supervised worker to be joined, and then replays the same report to
+    /// any further caller: every observer sees one completed shutdown, not
+    /// a second teardown.
     ///
-    /// P1 scope: fibers registered by this skeleton carry no running state
-    /// yet, so nothing needs to be awaited here. The generation teardown
-    /// protocol (quiesce, cancel, cleanup, quarantine) attaches to this
-    /// same entry point in P2.
-    pub async fn shutdown(&self, _options: ShutdownOptions) -> ShutdownReport {
-        let mut state = self.inner.lock_state();
-        if state.closed {
-            // Idempotent terminal state: observe the already-completed
-            // report. (Unreachable mix of closed-without-report does not
-            // happen through the public API; fall through defensively.)
-            if let Some(report) = &state.last_shutdown {
-                return report.clone();
+    /// `options.timeout` bounds the wait. When it passes, fibers whose
+    /// work has not exited end [`Quarantined`](crate::FiberState::Quarantined)
+    /// and are counted in the report instead of being reported disposed —
+    /// a deadline is a fact about time, never a claim that work stopped.
+    ///
+    /// Refused with [`Error::WouldDeadlock`] when called from inside a
+    /// framework callback: shutdown would wait on the caller itself
+    /// (docs/03-runtime.md §7).
+    pub async fn shutdown(&self, options: ShutdownOptions) -> Result<ShutdownReport, Error> {
+        if crate::coordinator::callback::in_callback() {
+            return Err(Error::WouldDeadlock);
+        }
+        if let Some(report) = self.inner.stored_report() {
+            return Ok(report);
+        }
+        let reply = self
+            .inner
+            .submit(|reply: oneshot::Sender<ShutdownReport>| Command::Shutdown { options, reply })
+            .await;
+        match reply {
+            Ok(report) => {
+                self.inner.finish_shutdown(report.clone());
+                Ok(report)
             }
-            return ShutdownReport {
-                fibers_disposed: 0,
-                runtimes_dropped: 0,
-            };
+            Err(Error::HostClosed) => {
+                // The actor already finished and drained; observe the
+                // stored report if one exists.
+                self.inner.stored_report().ok_or(Error::HostClosed)
+            }
+            Err(other) => Err(other),
         }
-        state.closed = true;
-        let runtimes = std::mem::take(&mut state.runtimes);
-        drop(state);
-
-        let mut fibers_disposed = 0usize;
-        for runtime in runtimes.values() {
-            fibers_disposed += runtime.fiber_count();
-        }
-        let report = ShutdownReport {
-            fibers_disposed,
-            runtimes_dropped: runtimes.len(),
-        };
-        self.inner.lock_state().last_shutdown = Some(report.clone());
-        report
     }
 }
 
@@ -161,162 +222,82 @@ impl Drop for App {
     /// Best-effort close on drop — this is **not** a substitute for
     /// [`App::shutdown`].
     ///
-    /// Dropping the last app handle only marks the app closed and releases
-    /// the registry so lingering weak holders see [`Error::HostClosed`].
-    /// It never runs async cleanup, never blocks, and promises nothing
-    /// about resources that would have needed awaited disposal. See the
-    /// `Shutdown contract` section on [`App`].
+    /// Dropping the last app handle closes admissions and, once the
+    /// coordinator notices the closed mailbox, aborts workers and retires
+    /// user-owned values off the actor. It never runs awaited cleanup,
+    /// never blocks, and promises nothing about resources that would have
+    /// needed awaited disposal. See the `Shutdown contract` section on
+    /// [`App`].
     fn drop(&mut self) {
-        let mut state = self.inner.lock_state();
-        state.closed = true;
-        state.runtimes.clear();
+        // Only the host's own handle — the last strong reference —
+        // performs the best-effort close. Handles fabricated by
+        // [`WeakApp::upgrade`] are views: dropping them must never close
+        // the app out from under its owner.
+        if Arc::strong_count(&self.inner) == 1 {
+            self.inner.closed.store(true, Ordering::Release);
+        }
     }
 }
 
 /// Interior state shared by the app, its contexts and its fiber handles.
 pub(crate) struct AppInner {
     name: String,
-    state: Mutex<AppState>,
-}
-
-struct AppState {
-    closed: bool,
-    runtimes: HashMap<DefinitionId, Arc<PluginRuntime>>,
-    last_shutdown: Option<ShutdownReport>,
+    tx: CommandSender,
+    closed: AtomicBool,
+    report: Mutex<Option<ShutdownReport>>,
 }
 
 impl AppInner {
-    fn new(name: String) -> Self {
-        Self {
-            name,
-            state: Mutex::new(AppState {
-                closed: false,
-                runtimes: HashMap::new(),
-                last_shutdown: None,
-            }),
-        }
-    }
-
-    fn lock_state(&self) -> std::sync::MutexGuard<'_, AppState> {
-        // A poisoned lock means a kernel bug; fail loudly instead of
-        // operating on possibly-correlated state.
-        self.state.lock().expect("cordis app state lock poisoned")
-    }
-
     pub(crate) fn name(&self) -> &str {
         &self.name
     }
 
-    pub(crate) fn next_runtime_id(&self) -> RuntimeId {
-        RuntimeId::alloc_global()
+    fn stored_report(&self) -> Option<ShutdownReport> {
+        self.report
+            .lock()
+            .expect("cordis report lock poisoned")
+            .clone()
     }
 
-    pub(crate) fn next_fiber_id(&self) -> FiberId {
-        FiberId::alloc_global()
+    fn finish_shutdown(&self, report: ShutdownReport) {
+        let mut slot = self.report.lock().expect("cordis report lock poisoned");
+        *slot = Some(report);
+        self.closed.store(true, Ordering::Release);
     }
 
-    /// Admits a new fiber of `definition`.
+    /// Submits a command and awaits its reply.
     ///
-    /// Refuses admission with [`Error::HostClosed`] once the app is closed.
-    /// Reuses the runtime already registered for the definition, or creates
-    /// it on first load (V01). No user code runs here.
-    pub(crate) fn admit_fiber(
-        &self,
-        definition: DefinitionId,
-    ) -> Result<(Arc<PluginRuntime>, FiberId), Error> {
-        let mut state = self.lock_state();
-        if state.closed {
+    /// Maps every transport failure (closed host, vanished actor, dropped
+    /// caller-of-the-reply) to [`Error::HostClosed`]: a command that was
+    /// admitted keeps running under its owner even when its caller is
+    /// cancelled (docs/03-runtime.md §4.3).
+    pub(crate) async fn submit<R, F>(&self, make: F) -> Result<R, Error>
+    where
+        F: FnOnce(oneshot::Sender<R>) -> Command,
+        R: Send + 'static,
+    {
+        if self.closed.load(Ordering::Acquire) {
             return Err(Error::HostClosed);
         }
-        let runtime: Arc<PluginRuntime> = state
-            .runtimes
-            .entry(definition)
-            .or_insert_with(|| Arc::new(PluginRuntime::new(self.next_runtime_id())))
-            .clone();
-        drop(state);
-
-        let fiber_id = self.next_fiber_id();
-        Ok((runtime, fiber_id))
-    }
-
-    /// Returns the stored configuration of `fiber`, which must belong to
-    /// the runtime registered for `definition`.
-    pub(crate) fn fiber_config(
-        &self,
-        definition: DefinitionId,
-        fiber: FiberId,
-    ) -> Result<AnyConfig, Error> {
-        let state = self.lock_state();
-        if state.closed {
-            return Err(Error::HostClosed);
+        let (reply_tx, reply_rx) = oneshot::channel();
+        match self.tx.send(make(reply_tx)).await {
+            Ok(()) => {}
+            Err(_) => {
+                return Err(Error::HostClosed);
+            }
         }
-        let runtime = state
-            .runtimes
-            .get(&definition)
-            .ok_or(Error::StaleGeneration { fiber })?;
-        runtime
-            .config_of(fiber)
-            .ok_or(Error::StaleGeneration { fiber })
-    }
-}
-
-/// Per-app runtime shared by every fiber loaded from one definition.
-///
-/// One definition (`DefinitionId`) maps to at most one `PluginRuntime` per
-/// app; loading the same definition again adds fibers to this runtime (V01).
-pub(crate) struct PluginRuntime {
-    runtime_id: RuntimeId,
-    fibers: Mutex<Vec<FiberRecord>>,
-}
-
-struct FiberRecord {
-    fiber_id: FiberId,
-    config: AnyConfig,
-}
-
-impl PluginRuntime {
-    pub(crate) fn new(runtime_id: RuntimeId) -> Self {
-        Self {
-            runtime_id,
-            fibers: Mutex::new(Vec::new()),
+        match reply_rx.await {
+            Ok(reply) => Ok(reply),
+            Err(_) => Err(Error::HostClosed),
         }
     }
-
-    pub(crate) fn runtime_id(&self) -> RuntimeId {
-        self.runtime_id
-    }
-
-    pub(crate) fn push_fiber(&self, fiber_id: FiberId, config: AnyConfig) {
-        self.fibers
-            .lock()
-            .expect("cordis fiber registry lock poisoned")
-            .push(FiberRecord { fiber_id, config });
-    }
-
-    pub(crate) fn config_of(&self, fiber_id: FiberId) -> Option<AnyConfig> {
-        self.fibers
-            .lock()
-            .expect("cordis fiber registry lock poisoned")
-            .iter()
-            .find(|record| record.fiber_id == fiber_id)
-            .map(|record| Arc::clone(&record.config))
-    }
-
-    fn fiber_count(&self) -> usize {
-        self.fibers
-            .lock()
-            .expect("cordis fiber registry lock poisoned")
-            .len()
-    }
 }
 
-impl fmt::Debug for App {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let state = self.inner.lock_state();
+impl std::fmt::Debug for App {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("App")
             .field("name", &self.inner.name)
-            .field("closed", &state.closed)
-            .field("runtimes", &state.runtimes.len())
+            .field("closed", &self.is_closed())
             .finish()
     }
 }
