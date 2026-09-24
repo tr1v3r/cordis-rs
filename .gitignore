@@ -11,3 +11,7 @@
 *.profraw
 /coverage
 /.cargo-home/
+
+# Go caches used for golden generation (see tests/golden.rs)
+/.gocache/
+/.gopath/
