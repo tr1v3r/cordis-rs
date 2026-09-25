@@ -116,8 +116,13 @@ jobs:
       # no threshold is enforced here. The measured numbers and the exact
       # toolchain that produced them are recorded INTO summary.txt and the
       # job log so every reviewer can compare runs against the checked-in
-      # baseline (coverage/summary.txt at 87.16% regions / 86.73% lines
-      # TOTAL, cargo-llvm-cov via taiki-e/install-action@v2, rustc stable).
+      # baseline (coverage/summary.txt, measured at commit a23eeaa via
+      # stable rustc -Cinstrument-coverage + Apple LLVM 21.0.0 llvm-cov:
+      # 82.55% regions / 82.79% lines TOTAL over the same --all-targets
+      # suite; its header records the exact commands). CI numbers come
+      # from upstream cargo-llvm-cov via taiki-e/install-action@v2 on
+      # stable rustc — treat them as the reference and expect small
+      # deltas against the local reproduction.
       # Promoting this to a gate later means adding --fail-under-lines
       # with a consciously chosen threshold — not done silently here.
       - name: Generate lcov and summary reports
