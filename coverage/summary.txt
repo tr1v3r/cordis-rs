@@ -1,0 +1,34 @@
+# cordis-rs coverage (observational, NOT a gate — see .github/workflows/integration.yml)
+# baseline recorded in repair-round 2 from the same --workspace --all-targets suite;
+# CI regenerates this table with its exact toolchain versions in the artifact.
+# measured TOTAL: 87.16% regions / 86.73% lines (local run, cargo-llvm-cov report).
+Filename                                      Regions    Missed Regions     Cover   Functions  Missed Functions  Executed       Lines      Missed Lines     Cover    Branches   Missed Branches     Cover
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+cordis-core/src/app.rs                            189                24    87.30%          28                 3    89.29%         145                18    87.59%           0                 0         -
+cordis-core/src/context.rs                       1129               193    82.91%         161                22    86.34%        1035               150    85.51%           0                 0         -
+cordis-core/src/coordinator/callback.rs            48                 0   100.00%          10                 0   100.00%          32                 0   100.00%           0                 0         -
+cordis-core/src/coordinator/events.rs             236                 9    96.19%          14                 1    92.86%         191                 7    96.34%           0                 0         -
+cordis-core/src/coordinator/mod.rs               3566               489    86.29%         160                 9    94.38%        2359               342    85.50%           0                 0         -
+cordis-core/src/coordinator/operation.rs          147                11    92.52%          13                 2    84.62%          83                12    85.54%           0                 0         -
+cordis-core/src/coordinator/retire.rs              58                 4    93.10%           5                 0   100.00%          41                 6    85.37%           0                 0         -
+cordis-core/src/coordinator/services.rs           667                37    94.45%          32                 1    96.88%         407                16    96.07%           0                 0         -
+cordis-core/src/coordinator/supervisor.rs         723               109    84.92%          75                 7    90.67%         559               105    81.22%           0                 0         -
+cordis-core/src/effect.rs                          83                10    87.95%          19                 1    94.74%          62                 5    91.94%           0                 0         -
+cordis-core/src/error.rs                          181                69    61.88%          18                 3    83.33%         135                48    64.44%           0                 0         -
+cordis-core/src/events.rs                         363                56    84.57%          48                 5    89.58%         255                37    85.49%           0                 0         -
+cordis-core/src/id.rs                             154                 3    98.05%          20                 1    95.00%         104                 3    97.12%           0                 0         -
+cordis-core/src/lib.rs                            373                 3    99.20%          22                 0   100.00%         154                 0   100.00%           0                 0         -
+cordis-core/src/machine.rs                       1613               103    93.61%          71                 8    88.73%         979                74    92.44%           0                 0         -
+cordis-core/src/plugin.rs                         259                16    93.82%          34                 8    76.47%         165                 8    95.15%           0                 0         -
+cordis-core/src/report.rs                          27                 0   100.00%           2                 0   100.00%          25                 0   100.00%           0                 0         -
+cordis-core/src/services.rs                       392                47    88.01%          37                 6    83.78%         264                37    85.98%           0                 0         -
+cordis-loader/src/compose.rs                      794               155    80.48%          40                 3    92.50%         415                71    82.89%           0                 0         -
+cordis-loader/src/dump.rs                         288                34    88.19%          19                 4    78.95%         153                19    87.58%           0                 0         -
+cordis-loader/src/error.rs                         49                17    65.31%           2                 0   100.00%          32                 9    71.88%           0                 0         -
+cordis-loader/src/lib.rs                            3                 0   100.00%           1                 0   100.00%           3                 0   100.00%           0                 0         -
+cordis-loader/src/model.rs                        249                14    94.38%          22                 1    95.45%         165                 8    95.15%           0                 0         -
+cordis-loader/src/mount.rs                        635               176    72.28%          67                18    73.13%         465               125    73.12%           0                 0         -
+cordis-loader/src/plan.rs                         548                43    92.15%          43                 5    88.37%         380                29    92.37%           0                 0         -
+cordis-loader/src/registry.rs                     190                43    77.37%          29                10    65.52%         135                31    77.04%           0                 0         -
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+TOTAL                                           12964              1665    87.16%         992               118    88.10%        8743              1160    86.73%           0                 0         -

@@ -22,8 +22,8 @@ use crate::coordinator::command::InternalMsg;
 use crate::effect::{Cleanup, CloseGateOnDrop, Gate, SetupFn, TaskFn};
 use crate::error::{Error, PluginError};
 use crate::events::{
-    DispatchFailure, DispatchOutcome, DispatchPayload, DispatchReport, EventMode, ListenerHandler,
-    NextErased, WaterfallFinal,
+    DispatchFailure, DispatchOutcome, DispatchPayload, DispatchReport, EventMode, EventResponse,
+    ListenerHandler, NextErased, WaterfallFinal,
 };
 use crate::id::{DispatchId, EffectId, FiberId, GenerationId, TaskId};
 use crate::plugin::{AnyConfig, ErasedPlugin};
@@ -306,6 +306,123 @@ pub(crate) struct DispatchJob {
     /// level deeper (docs/04 §3.3), so nested dispatches from handlers
     /// see an accurate depth.
     pub(crate) caller_depth: u32,
+    /// Live registry of handler child tasks this dispatch spawned. The
+    /// runners remove each handle as they join it; anything left when
+    /// the worker settles (error, panic or abort) is aborted **and
+    /// joined** by [`drain_child_tasks`] before `DispatchFinished` is
+    /// reported — a started subtask is never silently detached
+    /// (docs/03-runtime.md §8: dropping a JoinHandle is not
+    /// cancellation).
+    pub(crate) children: ChildTasks,
+}
+
+/// Shared registry of a dispatch's live handler child tasks: the real
+/// `JoinHandle`s, not proxies. Runners remove each handle as they join
+/// it; anything left when the worker settles (error, panic or abort) is
+/// aborted **and joined** by [`drain_child_tasks`] before
+/// `DispatchFinished` is reported — a started subtask is never silently
+/// detached (docs/03-runtime.md §8: dropping a `JoinHandle` is not
+/// cancellation).
+pub(crate) type ChildTasks = std::sync::Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>;
+
+/// One result slot of a parallel dispatch.
+type ResultSlot = std::sync::Arc<std::sync::Mutex<Option<Result<EventResponse, PluginError>>>>;
+/// A started parallel child awaiting its settle pass.
+type PendingChild = (
+    usize,
+    tokio::task::Id,
+    tokio::sync::oneshot::Receiver<Result<EventResponse, PluginError>>,
+);
+
+fn register_child(children: &ChildTasks, handle: tokio::task::JoinHandle<()>) {
+    children.lock().expect("cordis child registry").push(handle);
+}
+
+fn forget_child(children: &ChildTasks, id: tokio::task::Id) {
+    children
+        .lock()
+        .expect("cordis child registry")
+        .retain(|live| live.id() != id);
+}
+
+fn take_child(children: &ChildTasks, id: tokio::task::Id) -> Option<tokio::task::JoinHandle<()>> {
+    let mut registry = children.lock().expect("cordis child registry");
+    let position = registry.iter().position(|live| live.id() == id)?;
+    Some(registry.swap_remove(position))
+}
+
+/// Spawns a child under the worker's task-locals and returns how to
+/// settle it: the completion channel plus the child's registry identity.
+fn start_child<T, F>(
+    children: &ChildTasks,
+    fut: F,
+) -> (
+    tokio::sync::oneshot::Receiver<Result<T, PluginError>>,
+    tokio::task::Id,
+)
+where
+    T: Send + 'static,
+    F: std::future::Future<Output = Result<T, PluginError>> + Send + 'static,
+{
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    // `fut` arrives already wrapped by `inherit_worker_locals` in the
+    // worker's context: the task-locals must be captured where they
+    // exist, not inside the spawned child.
+    let handle = tokio::spawn(async move {
+        let outcome = fut.await;
+        let _ = tx.send(outcome);
+    });
+    let id = handle.id();
+    register_child(children, handle);
+    (rx, id)
+}
+
+/// Settles one started child: awaits its completion channel, and when
+/// the child died before sending (panic or abort) joins its very handle
+/// to recover the panic payload. Either way the child is out of the
+/// registry by the time this returns.
+async fn settle_child<T>(
+    children: &ChildTasks,
+    id: tokio::task::Id,
+    rx: tokio::sync::oneshot::Receiver<Result<T, PluginError>>,
+) -> Result<T, PluginError> {
+    match rx.await {
+        Ok(outcome) => {
+            forget_child(children, id);
+            outcome
+        }
+        Err(_) => match take_child(children, id) {
+            // The channel closed without a send: the child exited
+            // abnormally. Join its handle to classify (panic payload)
+            // and to observe the exit.
+            Some(handle) => match handle.await {
+                Ok(()) => Err(PluginError::from("handler task was cancelled")),
+                Err(join_error) if join_error.is_panic() => {
+                    Err(panic_to_plugin(join_error.into_panic()))
+                }
+                Err(_) => Err(PluginError::from("handler task was cancelled")),
+            },
+            None => Err(PluginError::from("handler task was cancelled")),
+        },
+    }
+}
+
+/// Aborts and joins every registered child: the supervised teardown for
+/// error and cancellation paths. Returns only when all started subtasks
+/// have definitely exited.
+pub(crate) async fn drain_child_tasks(children: &ChildTasks) {
+    loop {
+        let next = children.lock().expect("cordis child registry").pop();
+        match next {
+            Some(handle) => {
+                handle.abort();
+                // Join even after abort: the task must actually exit
+                // before DispatchFinished is reported.
+                let _ = handle.await;
+            }
+            None => return,
+        }
+    }
 }
 
 /// Runs one dispatch to completion inside a worker task.
@@ -431,8 +548,11 @@ pub(crate) fn inherit_worker_locals<F: std::future::Future>(
 }
 
 /// Awaits one boxed handler future on its own child task so a panicking
-/// handler surfaces as a join error instead of unwinding the worker.
+/// handler surfaces as a per-listener failure instead of unwinding the
+/// worker. The child is registered for supervised teardown and
+/// deregistered when this join observes its exit.
 async fn join_handler(
+    children: &ChildTasks,
     fut: std::pin::Pin<
         Box<
             dyn std::future::Future<Output = Result<crate::events::ControlFlowErased, PluginError>>
@@ -440,16 +560,14 @@ async fn join_handler(
         >,
     >,
 ) -> Result<crate::events::ControlFlowErased, PluginError> {
-    match tokio::spawn(inherit_worker_locals(fut)).await {
-        Ok(result) => result,
-        Err(join_error) if join_error.is_panic() => Err(panic_to_plugin(join_error.into_panic())),
-        Err(_) => Err(PluginError::from("handler task was cancelled")),
-    }
+    let (rx, id) = start_child(children, inherit_worker_locals(fut));
+    settle_child(children, id, rx).await
 }
 
 /// Awaits one boxed value-producing handler future (parallel /
-/// waterfall) with the same panic isolation.
+/// waterfall) with the same panic isolation and registration.
 async fn join_value_handler(
+    children: &ChildTasks,
     fut: std::pin::Pin<
         Box<
             dyn std::future::Future<Output = Result<crate::events::EventResponse, PluginError>>
@@ -457,15 +575,13 @@ async fn join_value_handler(
         >,
     >,
 ) -> Result<crate::events::EventResponse, PluginError> {
-    match tokio::spawn(inherit_worker_locals(fut)).await {
-        Ok(result) => result,
-        Err(join_error) if join_error.is_panic() => Err(panic_to_plugin(join_error.into_panic())),
-        Err(_) => Err(PluginError::from("handler task was cancelled")),
-    }
+    let (rx, id) = start_child(children, inherit_worker_locals(fut));
+    settle_child(children, id, rx).await
 }
 
 async fn run_serial(job: DispatchJob) -> Result<DispatchOutcome, Error> {
     let DispatchPayload::Shared(payload) = &job.payload else {
+        // No children have been spawned yet; nothing to supervise.
         return Err(Error::EventConflict {
             event: String::new(),
             reason: "serial dispatch carried an owned payload".to_owned(),
@@ -473,13 +589,27 @@ async fn run_serial(job: DispatchJob) -> Result<DispatchOutcome, Error> {
     };
     for (listener, handler) in &job.handlers {
         let ListenerHandler::Serial(handle) = &**handler else {
+            // Configuration error: supervise any earlier children before
+            // failing so nothing already started detaches.
+            drain_child_tasks(&job.children).await;
             return Err(Error::HandlerFailed {
                 listener: Some(*listener),
                 source: PluginError::from("serial dispatch claimed a non-serial handler"),
             });
         };
-        let fut = handle(std::sync::Arc::clone(payload));
-        match join_handler(fut).await {
+        // The factory call constructs the handler future: a panic here
+        // never crosses into the worker — it is this listener's failure.
+        let fut = match catch_unwind(AssertUnwindSafe(|| handle(std::sync::Arc::clone(payload)))) {
+            Ok(fut) => fut,
+            Err(panic) => {
+                drain_child_tasks(&job.children).await;
+                return Err(Error::HandlerFailed {
+                    listener: Some(*listener),
+                    source: panic_to_plugin(panic),
+                });
+            }
+        };
+        match join_handler(&job.children, fut).await {
             Ok(std::ops::ControlFlow::Continue(())) => continue,
             Ok(std::ops::ControlFlow::Break(value)) => {
                 return Ok(DispatchOutcome::Flow(Some(value)));
@@ -497,50 +627,81 @@ async fn run_serial(job: DispatchJob) -> Result<DispatchOutcome, Error> {
 
 async fn run_parallel(job: DispatchJob) -> Result<DispatchOutcome, Error> {
     let DispatchPayload::Shared(payload) = &job.payload else {
+        // No children spawned yet; nothing to supervise.
         return Err(Error::EventConflict {
             event: String::new(),
             reason: "parallel dispatch carried an owned payload".to_owned(),
         });
     };
     let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(PARALLELISM_CAP));
-    let mut tasks = Vec::with_capacity(job.handlers.len());
-    for (listener, handler) in &job.handlers {
+    let total = job.handlers.len();
+    // Results land in dispatch-order slots no matter the completion
+    // order (V30); a slot that never fills reports "never ran" so an
+    // early supervised exit stays honest. Slots are shared `Arc`s
+    // because child tasks ('static) write them.
+    let slots: Vec<ResultSlot> = (0..total)
+        .map(|_| std::sync::Arc::new(std::sync::Mutex::new(None)))
+        .collect();
+    // Phase A — start everything the concurrency budget allows. Each
+    // started child is registered; its completion channel is collected
+    // for the join phase.
+    let mut pending: Vec<PendingChild> = Vec::with_capacity(total);
+    for (index, (listener, handler)) in job.handlers.iter().enumerate() {
         let ListenerHandler::Parallel(handle) = &**handler else {
+            // Configuration error: abort+join everything already started
+            // before failing — started work is never detached.
+            drain_child_tasks(&job.children).await;
             return Err(Error::HandlerFailed {
                 listener: Some(*listener),
                 source: PluginError::from("parallel dispatch claimed a non-parallel handler"),
             });
         };
-        let fut = handle(std::sync::Arc::clone(payload));
+        // Factory call under a panic boundary: a construction panic is
+        // this listener's failure, recorded in its slot; the dispatch
+        // still starts and joins every other handler (V30).
+        let fut = match catch_unwind(AssertUnwindSafe(|| handle(std::sync::Arc::clone(payload)))) {
+            Ok(fut) => fut,
+            Err(panic) => {
+                *slots[index].lock().expect("cordis result slot") =
+                    Some(Err(panic_to_plugin(panic)));
+                continue;
+            }
+        };
         let permit = std::sync::Arc::clone(&semaphore)
             .acquire_owned()
             .await
             .expect("semaphore never closed");
-        // Bounded fan: the permit is held for the handler's lifetime; all
-        // started work is awaited before the dispatch completes.
-        tasks.push((
-            *listener,
-            tokio::spawn(async move {
-                let _permit = permit;
-                inherit_worker_locals(fut).await
-            }),
-        ));
+        // Wrap in the worker's context so the child inherits the
+        // callback-origin marker and the nesting depth.
+        let wrapped = inherit_worker_locals(fut);
+        let (rx, id) = start_child(&job.children, async move {
+            let _permit = permit;
+            wrapped.await
+        });
+        pending.push((index, id, rx));
     }
-    let mut results = Vec::with_capacity(tasks.len());
-    for (listener, task) in tasks {
-        match task.await {
-            Ok(Ok(value)) => results.push(Ok(value)),
-            Ok(Err(error)) => results.push(Err(error)),
-            Err(join_error) if join_error.is_panic() => {
-                results.push(Err(panic_to_plugin(join_error.into_panic())))
-            }
-            Err(_) => results.push(Err(PluginError::from(
-                "parallel handler task was cancelled",
-            ))),
-        }
-        let _ = listener;
+    // Phase B — settle in registration order (stable assembly). Each
+    // settle observes the child's exit and deregisters it; a child that
+    // died before sending its outcome is joined by id to recover the
+    // panic payload.
+    for (index, id, rx) in pending {
+        let outcome = settle_child(&job.children, id, rx).await;
+        *slots[index].lock().expect("cordis result slot") = Some(outcome);
     }
-    Ok(DispatchOutcome::Parallel(results))
+    let mut assembled = Vec::with_capacity(total);
+    for slot in &slots {
+        let value = slots_take(slot);
+        assembled.push(value);
+    }
+    Ok(DispatchOutcome::Parallel(assembled))
+}
+
+/// Takes one result slot, defaulting to an explicit "never ran" error.
+fn slots_take(slot: &ResultSlot) -> Result<EventResponse, PluginError> {
+    slot.lock()
+        .expect("cordis result slot")
+        .take()
+        .unwrap_or_else(|| Err(PluginError::from("parallel handler never ran")))
 }
 
 async fn run_waterfall(job: DispatchJob) -> Result<DispatchOutcome, Error> {
@@ -562,10 +723,13 @@ async fn run_waterfall(job: DispatchJob) -> Result<DispatchOutcome, Error> {
         .map(|(_, h)| std::sync::Arc::clone(h))
         .collect();
     let head = NextErased::new(chain, final_);
-    let response = join_value_handler(Box::pin(head.run(payload)))
+    let response = join_value_handler(&job.children, Box::pin(head.run(payload)))
         .await
         .map_err(|source| Error::HandlerFailed {
             listener: None,
+            // Middleware and final factory panics surface here too: the
+            // construction calls run inside the spawned chain, whose
+            // join error this is (classified as HandlerFailed).
             source,
         })?;
     Ok(DispatchOutcome::Waterfall(response))
@@ -580,6 +744,7 @@ pub(crate) fn spawn_dispatch(
     internal: mpsc::UnboundedSender<InternalMsg>,
 ) -> WorkerTicket {
     let dispatch = job.dispatch;
+    let children = Arc::clone(&job.children);
     let worker: JoinHandle<Result<DispatchOutcome, Error>> =
         tokio::spawn(async move { CALLBACK_ORIGIN.scope((), run_dispatch_job(job)).await });
     let abort = worker.abort_handle();
@@ -594,6 +759,11 @@ pub(crate) fn spawn_dispatch(
                 reason: "dispatch worker aborted before completion".to_owned(),
             }),
         };
+        // Supervised teardown: any child the worker failed or was
+        // aborted before joining is aborted and joined HERE, so
+        // DispatchFinished is only ever reported once every started
+        // subtask has definitely exited (docs/03-runtime.md §8).
+        drain_child_tasks(&children).await;
         let _ = internal.send(InternalMsg::DispatchFinished { dispatch, result });
     });
     WorkerTicket { abort }
@@ -646,6 +816,7 @@ mod tests {
             payload: DispatchPayload::Shared(Arc::new(7u32)),
             final_: None,
             caller_depth: 5,
+            children: Arc::new(std::sync::Mutex::new(Vec::new())),
         };
         run_dispatch_job(job)
             .await

@@ -2174,6 +2174,19 @@ impl Coordinator {
                 ),
             });
         }
+        // Capacity gate FIRST, before any once claim or registry
+        // mutation: a refused dispatch must leave the event registry
+        // exactly as it was, so a saturated worker budget can never burn
+        // a `once` listener (claim-and-refuse would consume it forever).
+        if self.workers.len() >= self.limits.max_workers {
+            return Err(Error::CapacityExceeded {
+                reason: format!(
+                    "dispatch refused: live worker budget ({}) exhausted",
+                    self.limits.max_workers
+                ),
+            });
+        }
+
         let dispatch_scope = scopes.resolve(&name);
         let selected: Vec<EffectId> = record
             .listeners
@@ -2224,15 +2237,6 @@ impl Coordinator {
             claimed.push((id, handler));
         }
 
-        if self.workers.len() >= self.limits.max_workers {
-            return Err(Error::CapacityExceeded {
-                reason: format!(
-                    "dispatch refused: live worker budget ({}) exhausted",
-                    self.limits.max_workers
-                ),
-            });
-        }
-
         let dispatch = DispatchId::alloc_global();
         self.dispatches.insert(
             dispatch,
@@ -2250,6 +2254,7 @@ impl Coordinator {
             payload: request.payload,
             final_: request.final_,
             caller_depth: request.caller_depth,
+            children: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
         };
         let ticket = supervisor::spawn_dispatch(job, self.internal_tx.clone());
         self.workers.insert(WorkerKey::Dispatch(dispatch), ticket);

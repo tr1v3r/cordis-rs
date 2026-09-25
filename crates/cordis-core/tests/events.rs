@@ -1486,3 +1486,305 @@ async fn diagnostics_stream_reports_lifecycle_records() {
         .await
         .expect("shutdown");
 }
+
+// ---------------------------------------------------------------------------
+// Repair-round-2 hardening: capacity-gated once claims and supervised
+// child teardown under successor factory panics.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn once_survives_worker_saturation_and_still_runs_exactly_once() {
+    // The capacity gate runs BEFORE any once claim: a dispatch refused
+    // for a saturated worker budget must leave the once listener
+    // registered and unclaimed, so it still executes exactly once once
+    // capacity returns.
+    let app = App::builder().max_workers(1).build().expect("app builds");
+    let root = app.context();
+
+    let runs = Arc::new(AtomicUsize::new(0));
+    let hold = Arc::new(Notify::new());
+    let hold_entered = Arc::new(Notify::new());
+    let registration = slot::<Registration>();
+    let once_key = QueryKey::<Ping, u32>::new("sat-once");
+    let hold_key = QueryKey::<Ping, u32>::new("sat-hold");
+
+    let hold_plugin = {
+        let hold = Arc::clone(&hold);
+        let hold_entered = Arc::clone(&hold_entered);
+        define("hold", move |ctx: Context, _cfg: Arc<Cfg>| {
+            let hold = Arc::clone(&hold);
+            let hold_entered = Arc::clone(&hold_entered);
+            let key = hold_key.clone();
+            async move {
+                ctx.on_serial(
+                    key,
+                    move |_event: Arc<Ping>| {
+                        let hold = Arc::clone(&hold);
+                        let hold_entered = Arc::clone(&hold_entered);
+                        async move {
+                            // Signal admission first: the test submits its
+                            // saturation probe only once this handler is
+                            // provably occupying the worker slot.
+                            hold_entered.notify_one();
+                            hold.notified().await;
+                            Ok(ControlFlow::<u32>::Break(1))
+                        }
+                    },
+                    ListenerConfig::default(),
+                )
+                .await?;
+                Ok(())
+            }
+        })
+    };
+    let once_plugin = {
+        let runs = Arc::clone(&runs);
+        let registration = Arc::clone(&registration);
+        define("once", move |ctx: Context, _cfg: Arc<Cfg>| {
+            let runs = Arc::clone(&runs);
+            let registration = Arc::clone(&registration);
+            let key = once_key.clone();
+            async move {
+                let reg = ctx
+                    .on_bail(
+                        key,
+                        move |_: &Ping| {
+                            runs.fetch_add(1, Ordering::SeqCst);
+                            Ok(ControlFlow::Break(7))
+                        },
+                        ListenerConfig::once(),
+                    )
+                    .await?;
+                *registration.lock().unwrap() = Some(reg);
+                Ok(())
+            }
+        })
+    };
+
+    let hold_handle = root.load(&hold_plugin, Cfg).await.expect("hold load");
+    hold_handle
+        .fiber
+        .wait_active(Instant::now() + Duration::from_secs(15))
+        .await
+        .expect("hold active");
+    let once_handle = root.load(&once_plugin, Cfg).await.expect("once load");
+    once_handle
+        .fiber
+        .wait_active(Instant::now() + Duration::from_secs(15))
+        .await
+        .expect("once active");
+
+    // Dispatch 1 occupies the single worker slot with a blocked serial
+    // handler.
+    let blocked_root = root.clone();
+    let blocked = tokio::spawn(async move {
+        blocked_root
+            .serial(QueryKey::<Ping, u32>::new("sat-hold"), Ping { seq: 0 })
+            .await
+    });
+    // Wait until the hold handler is provably inside its block: from
+    // here the single worker slot is occupied until we release it.
+    let occupied = tokio::time::timeout(Duration::from_secs(15), hold_entered.notified()).await;
+    assert!(occupied.is_ok(), "hold handler admitted");
+
+    // Dispatch 2 (the once) is refused for capacity — deterministically,
+    // because dispatch 1's worker stays live until we release it.
+    let refused = root
+        .bail(QueryKey::<Ping, u32>::new("sat-once"), Ping { seq: 0 })
+        .await;
+    match refused {
+        Err(Error::CapacityExceeded { reason }) => {
+            assert!(reason.contains("worker budget"), "{reason}");
+        }
+        other => panic!("expected CapacityExceeded, got {other:?}"),
+    }
+    // The refused dispatch must NOT have consumed the once claim: the
+    // listener is still registered.
+    let stats = app.stats().await.expect("stats");
+    assert_eq!(
+        stats.listeners_live, 2,
+        "once listener survived the refusal"
+    );
+    assert_eq!(runs.load(Ordering::SeqCst), 0);
+
+    // Capacity returns: release the blocked handler, let its worker
+    // finish, then the once runs — exactly once — across TWO racing
+    // dispatches.
+    hold.notify_one();
+    let _ = blocked.await.expect("blocked dispatch settles");
+    let settled = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if app.stats().await.expect("stats").workers_live == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    assert!(settled.is_ok(), "blocked worker retired");
+
+    let a = tokio::spawn({
+        let root = root.clone();
+        async move {
+            root.bail(QueryKey::<Ping, u32>::new("sat-once"), Ping { seq: 1 })
+                .await
+        }
+    });
+    let b = tokio::spawn({
+        let root = root.clone();
+        async move {
+            root.bail(QueryKey::<Ping, u32>::new("sat-once"), Ping { seq: 2 })
+                .await
+        }
+    });
+    let mut winners = 0;
+    for task in [a, b] {
+        if let Ok(Ok(Some(7))) = task.await {
+            winners += 1;
+        }
+    }
+    assert_eq!(winners, 1, "exactly one dispatch observed the break");
+    assert_eq!(runs.load(Ordering::SeqCst), 1, "once ran exactly once");
+    let retired = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if app.stats().await.expect("stats").listeners_live == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    assert!(retired.is_ok(), "once entry retired after its single run");
+
+    app.shutdown(ShutdownOptions::default())
+        .await
+        .expect("shutdown");
+}
+
+#[tokio::test]
+async fn successor_factory_panic_fails_the_listener_and_teardown_waits_for_the_blocked_predecessor()
+{
+    // A later serial listener whose FACTORY panics (the closure panics
+    // while constructing the future) is a per-listener HandlerFailed —
+    // never a worker panic — and the dispatch still waits for the
+    // earlier, barrier-blocked child before settling, so a concurrent
+    // dispose drains real in-flight work (V33 semantics under failure).
+    let app = App::builder().build().expect("app builds");
+    let root = app.context();
+    let log: Log = Arc::new(Mutex::new(Vec::new()));
+
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let key = QueryKey::<Ping, u32>::new("factory-panic");
+    let plugin = {
+        let log = Arc::clone(&log);
+        let entered = Arc::clone(&entered);
+        let release = Arc::clone(&release);
+        define("chain", move |ctx: Context, _cfg: Arc<Cfg>| {
+            let log = Arc::clone(&log);
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            let key = key.clone();
+            async move {
+                let first_log = Arc::clone(&log);
+                let first_entered = Arc::clone(&entered);
+                let first_release = Arc::clone(&release);
+                ctx.on_serial(
+                    key.clone(),
+                    move |_event: Arc<Ping>| {
+                        let log = Arc::clone(&first_log);
+                        let entered = Arc::clone(&first_entered);
+                        let release = Arc::clone(&first_release);
+                        Box::pin(async move {
+                            log_entry(&log, "first:entered");
+                            entered.notify_one();
+                            release.notified().await;
+                            log_entry(&log, "first:released");
+                            Ok(ControlFlow::<u32>::Continue(()))
+                        })
+                    },
+                    ListenerConfig::default(),
+                )
+                .await?;
+                // The successor's factory panics synchronously while
+                // constructing its future (the panic happens in the
+                // factory body, before any await).
+                ctx.on_serial(
+                    key,
+                    move |_event: Arc<Ping>| {
+                        panic!("successor factory boom");
+                        #[allow(unreachable_code)]
+                        async {
+                            Ok(ControlFlow::<u32>::Continue(()))
+                        }
+                    },
+                    ListenerConfig::default(),
+                )
+                .await?;
+                Ok(())
+            }
+        })
+    };
+    let handle = root.load(&plugin, Cfg).await.expect("load");
+    handle
+        .fiber
+        .wait_active(Instant::now() + Duration::from_secs(15))
+        .await
+        .expect("active");
+
+    // Start the dispatch: the first listener runs and blocks.
+    let dispatch_root = root.clone();
+    let dispatch = tokio::spawn(async move {
+        dispatch_root
+            .serial(QueryKey::<Ping, u32>::new("factory-panic"), Ping { seq: 0 })
+            .await
+    });
+    let started = tokio::time::timeout(Duration::from_secs(15), entered.notified()).await;
+    assert!(started.is_ok(), "first listener admitted and blocked");
+    // The dispatch cannot settle while the first child is in flight.
+    assert!(
+        !dispatch.is_finished(),
+        "dispatch waits for the in-flight child"
+    );
+
+    // Release: the first child finishes, then the successor's factory
+    // panics — classified as this listener's HandlerFailed.
+    release.notify_one();
+    let outcome = tokio::time::timeout(Duration::from_secs(15), dispatch)
+        .await
+        .expect("dispatch settles")
+        .expect("join");
+    match outcome {
+        Err(Error::HandlerFailed {
+            listener: Some(_),
+            source,
+        }) => {
+            assert!(
+                source.to_string().contains("factory boom"),
+                "panic payload preserved: {source}"
+            );
+        }
+        other => panic!("expected HandlerFailed with the factory panic, got {other:?}"),
+    }
+    assert_eq!(
+        *log.lock().unwrap(),
+        vec!["first:entered".to_owned(), "first:released".to_owned()],
+        "the blocked predecessor ran to completion before the failure"
+    );
+    // Everything supervised: no dispatch or child left behind.
+    let drained = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let stats = app.stats().await.expect("stats");
+            if stats.dispatches_in_flight == 0 && stats.workers_live == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    assert!(drained.is_ok(), "dispatch worker and children all exited");
+
+    app.shutdown(ShutdownOptions::default())
+        .await
+        .expect("shutdown");
+}

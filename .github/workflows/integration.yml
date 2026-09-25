@@ -111,12 +111,26 @@ jobs:
       # table with a TOTAL row; it goes to the job log and to summary.txt.
       # Doc-test coverage requires nightly-only cargo-llvm-cov support, so
       # coverage measures the same --all-targets suite as the gate above.
+      #
+      # COVERAGE IS OBSERVATIONAL, NOT A GATE (decided in repair-round 2):
+      # no threshold is enforced here. The measured numbers and the exact
+      # toolchain that produced them are recorded INTO summary.txt and the
+      # job log so every reviewer can compare runs against the checked-in
+      # baseline (coverage/summary.txt at 87.16% regions / 86.73% lines
+      # TOTAL, cargo-llvm-cov via taiki-e/install-action@v2, rustc stable).
+      # Promoting this to a gate later means adding --fail-under-lines
+      # with a consciously chosen threshold — not done silently here.
       - name: Generate lcov and summary reports
         run: |
           set -euo pipefail
           mkdir -p coverage
           cargo llvm-cov report --lcov --output-path coverage/lcov.info
-          cargo llvm-cov report | tee coverage/summary.txt
+          {
+            echo "# cordis-rs coverage (observational, NOT a gate — see workflow comments)"
+            echo "# toolchain: $(rustc -V) | $(cargo -V) | $(cargo llvm-cov --version)"
+            echo "# suite: cargo llvm-cov --workspace --all-targets --locked (doc tests excluded: nightly-only)"
+            cargo llvm-cov report
+          } | tee coverage/summary.txt
         timeout-minutes: 10
 
       # Reports are published as workflow artifacts only; no external token

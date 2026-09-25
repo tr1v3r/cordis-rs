@@ -7,11 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.1.0] - 2026-09-25
+Planned initial release of the cordis-rs workspace: the kernel MVP (P0–P5)
+of the cordis v4 plugin runtime standard plus the JSON loader/reconcile
+layer (P6–P7).
 
-Initial release of the cordis-rs workspace: the kernel MVP (P0–P5) of the
-cordis v4 plugin runtime standard plus the JSON loader/reconcile layer
-(P6–P7).
+> **Release status**: nothing has been published or tagged yet. The notes
+> below describe the content currently on `main` and will become the
+> `0.1.0` notes at the actual release; the version heading, date and
+> comparison links are only added when that release is cut. Do not link
+> to a `v0.1.0` tag before it exists.
 
 ### Added
 
@@ -76,5 +80,6 @@ cordis v4 plugin runtime standard plus the JSON loader/reconcile layer
 - P9 (HMR: Wasmtime, subprocess adapters, native dynamic libraries) is
   intentionally out of scope for this release.
 
+<!-- Release links are added when the release is actually cut:
 [Unreleased]: https://github.com/tr1v3r/cordis-rs/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/tr1v3r/cordis-rs/releases/tag/v0.1.0
+[0.1.0]: https://github.com/tr1v3r/cordis-rs/releases/tag/v0.1.0 -->

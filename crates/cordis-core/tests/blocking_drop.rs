@@ -58,10 +58,22 @@ fn v38_blocking_drop_runs_in_subprocess() {
 /// longer than the whole scenario. The coordinator must stay responsive,
 /// the shutdown deadline must hold, and retirement must count the value
 /// as *pending*, not completed.
+///
+/// Determinism contract: `Drop` publishes "I am inside the blocking
+/// region" on a shared flag *before* blocking; the scenario only submits
+/// its stats/shutdown probes once that flag is observed, driven by a
+/// watchdog deadline instead of a fixed sleep — the interleaving no
+/// longer depends on timing luck.
 fn child_scenario() {
-    struct BlockingDrop;
+    struct BlockingDrop {
+        entered: Arc<std::sync::atomic::AtomicBool>,
+    }
     impl Drop for BlockingDrop {
         fn drop(&mut self) {
+            // Signal first, block second: the test proceeds only after
+            // this point, so the probes really race a blocked lane.
+            self.entered
+                .store(true, std::sync::atomic::Ordering::Release);
             // Native blocking: no yielding, no cancellation.
             std::thread::sleep(Duration::from_millis(3_000));
         }
@@ -82,9 +94,15 @@ fn child_scenario() {
                 Ok(())
             });
 
+        let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let receipt = app
             .context()
-            .load(&plugin, BlockingDrop)
+            .load(
+                &plugin,
+                BlockingDrop {
+                    entered: Arc::clone(&entered),
+                },
+            )
             .await
             .expect("load");
         receipt.operation.wait().await.expect("active");
@@ -97,24 +115,20 @@ fn child_scenario() {
             OperationOutcome::Disposed { .. }
         ));
 
-        let t2 = Instant::now();
-        eprintln!(
-            "CHILD submitting stats at {} ms",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis()
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Watchdog-driven interleave: wait until the lane actually
+        // entered the blocking region (the Drop signaled), bounded by a
+        // deadline — no fixed sleep guessing when the block started.
+        let watchdog = Instant::now() + Duration::from_secs(2);
+        while !entered.load(std::sync::atomic::Ordering::Acquire) {
+            assert!(
+                Instant::now() < watchdog,
+                "drop never entered its blocking region (watchdog)"
+            );
+            tokio::task::yield_now().await;
+        }
+        // The lane is provably blocked NOW: stats and shutdown race a
+        // genuinely blocked Drop, not a scheduler accident.
         let stats = app.stats().await.expect("stats answer while lane blocked");
-        eprintln!(
-            "CHILD stats returned at {} ms (delta {:?})",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis(),
-            t2.elapsed()
-        );
         assert!(
             stats.retirement_pending >= 1,
             "retirement must not fake completion: {stats:?}"
