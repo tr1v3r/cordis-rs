@@ -136,11 +136,37 @@ async fn shutdown_joins_all_workers_before_reporting() {
     let root = app.context();
 
     let (gate_tx, gate_rx) = watch::channel(0u64);
+    let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let entered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    /// Records the worker's true exit: pushed from the future's Drop,
+    /// which runs strictly before the JoinHandle resolves.
+    struct ExitMarker {
+        log: Arc<Mutex<Vec<String>>>,
+        label: &'static str,
+    }
+    impl Drop for ExitMarker {
+        fn drop(&mut self) {
+            self.log.lock().unwrap().push(self.label.to_owned());
+        }
+    }
+
     let slow: Plugin<Config> = {
         let gate = gate_rx.clone();
+        let log = Arc::clone(&log);
+        let entered = Arc::clone(&entered);
         define("slow", move |_ctx, _cfg: Arc<Config>| {
             let mut gate = gate.clone();
+            let log = Arc::clone(&log);
+            let entered = Arc::clone(&entered);
             async move {
+                let _exit = ExitMarker {
+                    log: Arc::clone(&log),
+                    label: "worker-exit",
+                };
+                // Rendezvous: signal that this worker is provably inside
+                // its blocking region BEFORE the shutdown is requested.
+                entered.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 let target = *gate.borrow();
                 gate.wait_for(|count| *count > target)
                     .await
@@ -155,27 +181,58 @@ async fn shutdown_joins_all_workers_before_reporting() {
         let receipt = root.load(&slow, Config { slot }).await.expect("load");
         fibers.push(receipt);
     }
-    assert!(app.stats().await.unwrap().workers_live >= 1);
 
-    // Shutdown with a deadline while all workers are gated: root teardown
-    // disposes the fibers, which requires the workers to finish. Release
-    // them concurrently with the shutdown call — the join is observable
-    // because the report can only arrive after every worker reported.
-    let gate = gate_tx.clone();
-    let releaser = tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        gate.send_modify(|count| *count += 1);
-    });
-    let report: ShutdownReport = app
-        .shutdown(ShutdownOptions {
-            timeout: Some(Duration::from_secs(5)),
-        })
+    // Rendezvous: every worker is provably inside its gated region
+    // (bounded watchdog; no fixed sleep guessing the interleave).
+    let watch_entered = Arc::clone(&entered);
+    let all_in = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if watch_entered.load(std::sync::atomic::Ordering::SeqCst) >= 6 {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    assert!(all_in.is_ok(), "all six workers entered their gate");
+
+    // Request shutdown but do NOT release the gate yet. While the
+    // workers are gated the report cannot possibly be ready: poll the
+    // report future once with a no-op waker and require Pending — a
+    // deterministic proof that the join (not timing) holds it back.
+    let mut report_fut = std::pin::pin!(app.shutdown(ShutdownOptions {
+        timeout: Some(Duration::from_secs(5)),
+    }));
+    {
+        let waker = std::task::Waker::noop().clone();
+        let mut cx = std::task::Context::from_waker(&waker);
+        assert!(
+            matches!(report_fut.as_mut().poll(&mut cx), std::task::Poll::Pending),
+            "shutdown cannot complete while the workers are gated"
+        );
+    }
+
+    // Release AFTER the shutdown request: the workers exit (their Drop
+    // markers run), and only then may the report arrive.
+    gate_tx.send_modify(|count| *count += 1);
+    let report: ShutdownReport = report_fut
         .await
-        .expect("shutdown");
-    releaser.await.expect("releaser done");
+        .expect("shutdown completes after every join");
 
     assert_eq!(report.fibers_disposed, 6);
     assert_eq!(report.quarantined, 0);
+    // No yield between the report and the check: every worker's exit
+    // signal was recorded BEFORE the shutdown report arrived.
+    assert_eq!(
+        log.lock()
+            .unwrap()
+            .iter()
+            .filter(|e| *e == "worker-exit")
+            .count(),
+        6,
+        "worker exits recorded before the report: {:?}",
+        log.lock().unwrap()
+    );
     for receipt in &fibers {
         assert_eq!(
             receipt.fiber.status().await.unwrap_err().to_string(),

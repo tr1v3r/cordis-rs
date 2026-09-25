@@ -1788,3 +1788,435 @@ async fn successor_factory_panic_fails_the_listener_and_teardown_waits_for_the_b
         .await
         .expect("shutdown");
 }
+
+/// Repair-round 3: a child that delivered its outcome may still be
+/// winding down — its async block drops user-owned locals (here: a guard
+/// whose `Drop` blocks) only AFTER the send. The dispatch must not report
+/// completion before that child truly exited, and a concurrent teardown
+/// must join it too (the child stays in the registry until the real
+/// join, so abort-then-join observes the blocked exit).
+///
+/// Multi-thread runtime: the lingering `Drop` occupies one worker while
+/// the actor and the test keep scheduling on the other.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dispatch_and_teardown_wait_for_post_send_child_exit() {
+    /// Blocks inside `Drop` after recording the exit marker: the child's
+    /// outcome was already sent when this runs.
+    struct Linger {
+        log: Log,
+        delay: std::time::Duration,
+    }
+    impl Drop for Linger {
+        fn drop(&mut self) {
+            log_entry(&self.log, "child-exit");
+            std::thread::sleep(self.delay);
+        }
+    }
+
+    let app = App::builder().build().expect("app builds");
+    let root = app.context();
+    let linger_log: Log = Arc::new(Mutex::new(Vec::new()));
+    let linger_key = QueryKey::<Ping, u32>::new("linger");
+
+    let linger_plugin = {
+        let linger_log = Arc::clone(&linger_log);
+        let linger_key = linger_key.clone();
+        define("linger", move |ctx: Context, _cfg: Arc<Cfg>| {
+            let linger_log = Arc::clone(&linger_log);
+            let linger_key = linger_key.clone();
+            async move {
+                let handler_log = Arc::clone(&linger_log);
+                ctx.on_serial(
+                    linger_key,
+                    move |_event: Arc<Ping>| {
+                        let handler_log = Arc::clone(&handler_log);
+                        Box::pin(async move {
+                            log_entry(&handler_log, "handler-entered");
+                            let _guard = Linger {
+                                log: Arc::clone(&handler_log),
+                                delay: std::time::Duration::from_millis(250),
+                            };
+                            Ok(ControlFlow::<u32>::Continue(()))
+                        })
+                    },
+                    ListenerConfig::default(),
+                )
+                .await?;
+                Ok(())
+            }
+        })
+    };
+    let linger_handle = root.load(&linger_plugin, Cfg).await.expect("load");
+    linger_handle
+        .fiber
+        .wait_active(Instant::now() + Duration::from_secs(15))
+        .await
+        .expect("active");
+
+    // Part 1: the dispatch report arrives only after the child exited.
+    let dispatch_root = root.clone();
+    let dispatch_key = linger_key.clone();
+    let dispatch =
+        tokio::spawn(async move { dispatch_root.serial(dispatch_key, Ping { seq: 0 }).await });
+    // Rendezvous: the handler provably started (its future resolves
+    // immediately, so the child is in the post-send wind-down).
+    let entered = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if count(&linger_log, "handler-entered") >= 1 {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    assert!(entered.is_ok(), "handler entered");
+    let report = tokio::time::timeout(Duration::from_secs(15), dispatch)
+        .await
+        .expect("dispatch settles")
+        .expect("join");
+    assert!(report.is_ok(), "{report:?}");
+    // No yield between the report and the check: with the success-branch
+    // join, the exit marker must already be there — the report can never
+    // overtake the child's true exit.
+    assert_eq!(
+        count(&linger_log, "child-exit"),
+        1,
+        "dispatch completed before the child exited: {:?}",
+        linger_log.lock().unwrap()
+    );
+
+    // Part 2: a teardown racing a lingering child. Fresh fiber, dispatch
+    // in flight, dispose while the child is in its post-send Drop: the
+    // teardown aborts the dispatch worker, whose supervised drain then
+    // finds the child still registered and joins its blocked exit — the
+    // dispose report can only arrive after the child exited.
+    let race_log: Log = Arc::new(Mutex::new(Vec::new()));
+    let race_key = QueryKey::<Ping, u32>::new("linger-race");
+    let race_plugin = {
+        let race_log = Arc::clone(&race_log);
+        let race_key = race_key.clone();
+        define("linger-race", move |ctx: Context, _cfg: Arc<Cfg>| {
+            let race_log = Arc::clone(&race_log);
+            let race_key = race_key.clone();
+            async move {
+                let handler_log = Arc::clone(&race_log);
+                ctx.on_serial(
+                    race_key,
+                    move |_event: Arc<Ping>| {
+                        let handler_log = Arc::clone(&handler_log);
+                        Box::pin(async move {
+                            log_entry(&handler_log, "handler-entered");
+                            let _guard = Linger {
+                                log: Arc::clone(&handler_log),
+                                delay: std::time::Duration::from_millis(400),
+                            };
+                            Ok(ControlFlow::<u32>::Continue(()))
+                        })
+                    },
+                    ListenerConfig::default(),
+                )
+                .await?;
+                Ok(())
+            }
+        })
+    };
+    let race_handle = root.load(&race_plugin, Cfg).await.expect("load 2");
+    race_handle
+        .fiber
+        .wait_active(Instant::now() + Duration::from_secs(15))
+        .await
+        .expect("active 2");
+
+    let race_dispatch_root = root.clone();
+    let race_dispatch_key = race_key.clone();
+    let race_dispatch = tokio::spawn(async move {
+        race_dispatch_root
+            .serial(race_dispatch_key, Ping { seq: 0 })
+            .await
+    });
+    let entered2 = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if count(&race_log, "handler-entered") >= 1 {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    assert!(entered2.is_ok(), "second handler entered");
+    // The dispatch is provably in flight (its child is lingering).
+    assert!(!race_dispatch.is_finished(), "dispatch 2 still settling");
+
+    let dispose = race_handle.fiber.dispose().await.expect("dispose");
+    let outcome = tokio::time::timeout(Duration::from_secs(15), dispose.wait())
+        .await
+        .expect("dispose resolves")
+        .expect("outcome");
+    assert!(matches!(
+        &*outcome,
+        cordis_core::OperationOutcome::Disposed { .. }
+    ));
+    // The child's exit was observed BEFORE the dispose report: without
+    // the registry fix the drain would not know the child and the report
+    // could overtake the lingering exit.
+    assert_eq!(
+        count(&race_log, "child-exit"),
+        1,
+        "dispose reported before the child exited: {:?}",
+        race_log.lock().unwrap()
+    );
+    // The teardown quiesced (waited for) the in-flight dispatch instead
+    // of tearing it apart: it settles normally right after the child.
+    let race_outcome = tokio::time::timeout(Duration::from_secs(15), race_dispatch)
+        .await
+        .expect("dispatch 2 settles")
+        .expect("join");
+    assert!(race_outcome.is_ok(), "{race_outcome:?}");
+}
+
+/// Repair-round 3: ten parallel handlers — nine real ones beyond the
+/// concurrency cap (PARALLELISM_CAP is 8) plus a successor whose FACTORY
+/// panics. The eight first children are provably in flight when the
+/// panic happens; every started child is joined before the dispatch
+/// settles, results assemble in registration order with the factory
+/// panic in its own slot, and the ninth handler starts only after a
+/// permit frees (V30 under failure).
+#[tokio::test]
+async fn parallel_nine_handlers_with_successor_factory_panic_join_all_children() {
+    const REAL: usize = 9;
+
+    let app = App::builder().build().expect("app builds");
+    let root = app.context();
+    let log: Log = Arc::new(Mutex::new(Vec::new()));
+    let (release_tx, release_rx) = tokio::sync::watch::channel(0u64);
+    let key = QueryKey::<Ping, String>::new("nine");
+
+    let plugin = {
+        let log = Arc::clone(&log);
+        let release = release_rx.clone();
+        let key = key.clone();
+        define("nine", move |ctx: Context, _cfg: Arc<Cfg>| {
+            let log = Arc::clone(&log);
+            let release = release.clone();
+            let key = key.clone();
+            async move {
+                for index in 0..REAL {
+                    let log = Arc::clone(&log);
+                    let release = release.clone();
+                    ctx.on_parallel(
+                        key.clone(),
+                        move |event: Arc<Ping>| {
+                            let log = Arc::clone(&log);
+                            let mut release = release.clone();
+                            let index = index;
+                            let seq = event.seq;
+                            Box::pin(async move {
+                                log_entry(&log, format!("h{index}-entered"));
+                                // The first eight hold their permits until
+                                // released; the ninth only starts after a
+                                // permit frees and needs no gate.
+                                if index < 8 {
+                                    let target = *release.borrow();
+                                    release
+                                        .wait_for(|count| *count > target)
+                                        .await
+                                        .expect("gate lives");
+                                }
+                                Ok(format!("r{index}:{seq}"))
+                            })
+                        },
+                        ListenerConfig::default(),
+                    )
+                    .await?;
+                }
+                // The successor's factory panics while CONSTRUCTING the
+                // future: a per-listener failure, recorded in its slot.
+                ctx.on_parallel(
+                    key,
+                    move |_event: Arc<Ping>| {
+                        panic!("successor factory boom");
+                        #[allow(unreachable_code)]
+                        Box::pin(async move { Ok("never".to_owned()) })
+                    },
+                    ListenerConfig::default(),
+                )
+                .await?;
+                Ok(())
+            }
+        })
+    };
+    let handle = root.load(&plugin, Cfg).await.expect("load");
+    handle
+        .fiber
+        .wait_active(Instant::now() + Duration::from_secs(15))
+        .await
+        .expect("active");
+
+    let dispatch_root = root.clone();
+    let dispatch_key = key.clone();
+    let dispatch =
+        tokio::spawn(async move { dispatch_root.parallel(dispatch_key, Ping { seq: 7 }).await });
+
+    // Rendezvous: the first eight children are provably in flight (they
+    // hold all PARALLELISM_CAP permits; the ninth cannot have started).
+    const CAP: usize = 8; // mirrors supervisor::PARALLELISM_CAP
+    let saturated = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let entered = (0..CAP)
+                .filter(|i| count(&log, &format!("h{i}-entered")) >= 1)
+                .count();
+            if entered >= CAP {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    assert!(saturated.is_ok(), "first eight handlers in flight");
+    // ... and the dispatch cannot settle while they are.
+    assert!(!dispatch.is_finished(), "dispatch waits for its children");
+
+    // Release: the eight settle, the ninth starts (fast), the successor
+    // factory panic is already recorded in its slot.
+    release_tx.send_modify(|count| *count += 1);
+    let report = tokio::time::timeout(Duration::from_secs(15), dispatch)
+        .await
+        .expect("dispatch settles after every child joined")
+        .expect("join")
+        .expect("report");
+    assert_eq!(report.results.len(), REAL + 1);
+    for (index, entry) in report.results.iter().take(REAL).enumerate() {
+        assert_eq!(
+            entry.as_ref().unwrap(),
+            &format!("r{index}:7"),
+            "{report:?}"
+        );
+    }
+    match &report.results[REAL] {
+        Err(source) => {
+            assert!(
+                source.to_string().contains("successor factory boom"),
+                "{source}"
+            );
+        }
+        other => panic!("expected the factory panic in its slot, got {other:?}"),
+    }
+    // The ninth handler ran after a permit freed — proof that the join
+    // and permit discipline held under the concurrent failure.
+    assert_eq!(count(&log, "h8-entered"), 1, "{log:?}");
+    assert_eq!(count(&log, "h0-entered"), 1);
+
+    app.shutdown(ShutdownOptions::default())
+        .await
+        .expect("shutdown");
+}
+
+/// Repair-round 3, abort path: a shutdown deadline aborts an in-flight
+/// dispatch worker; its watcher aborts and joins every started handler
+/// child (their `Drop` guards run), the quarantined report stays honest,
+/// and the aborted dispatch surfaces an error to its caller.
+#[tokio::test]
+async fn dispatch_worker_abort_path_joins_children_at_deadline() {
+    let app = App::builder().build().expect("app builds");
+    let root = app.context();
+    let log: Log = Arc::new(Mutex::new(Vec::new()));
+    let hold = Arc::new(Notify::new());
+    let key = QueryKey::<Ping, String>::new("abort-path");
+
+    /// Records its own Drop: runs when the aborted child's future is
+    /// dropped, proving the child really exited.
+    struct DropMarker {
+        log: Log,
+        label: &'static str,
+    }
+    impl Drop for DropMarker {
+        fn drop(&mut self) {
+            log_entry(&self.log, self.label);
+        }
+    }
+
+    let plugin = {
+        let log = Arc::clone(&log);
+        let hold = Arc::clone(&hold);
+        let key = key.clone();
+        define("abort-path", move |ctx: Context, _cfg: Arc<Cfg>| {
+            let log = Arc::clone(&log);
+            let hold = Arc::clone(&hold);
+            let key = key.clone();
+            async move {
+                for _listener in 0..3 {
+                    let log = Arc::clone(&log);
+                    let hold = Arc::clone(&hold);
+                    ctx.on_parallel(
+                        key.clone(),
+                        move |_event: Arc<Ping>| {
+                            let log = Arc::clone(&log);
+                            let hold = Arc::clone(&hold);
+                            Box::pin(async move {
+                                let _marker = DropMarker {
+                                    log: Arc::clone(&log),
+                                    label: "child-dropped",
+                                };
+                                hold.notified().await;
+                                Ok("unreached".to_owned())
+                            })
+                        },
+                        ListenerConfig::default(),
+                    )
+                    .await?;
+                }
+                Ok(())
+            }
+        })
+    };
+    let handle = root.load(&plugin, Cfg).await.expect("load");
+    handle
+        .fiber
+        .wait_active(Instant::now() + Duration::from_secs(15))
+        .await
+        .expect("active");
+
+    let dispatch_root = root.clone();
+    let dispatch_key = key.clone();
+    let dispatch =
+        tokio::spawn(async move { dispatch_root.parallel(dispatch_key, Ping { seq: 0 }).await });
+    // Let the (unreleased) handlers reach their hold point; nothing can
+    // settle while they are there.
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+    assert!(!dispatch.is_finished(), "dispatch in flight");
+
+    // The deadline aborts the dispatch worker: the watcher aborts and
+    // joins every child (their Drop guards run), then reports. The
+    // shutdown report itself stays honest about the quarantine.
+    let report = app
+        .shutdown(ShutdownOptions {
+            timeout: Some(Duration::from_millis(200)),
+        })
+        .await
+        .expect("deadline bounds the shutdown");
+    assert_eq!(report.fibers_disposed, 0, "{report:?}");
+    assert_eq!(report.quarantined, 1, "{report:?}");
+
+    // The aborted children really exited: their Drop markers ran (the
+    // watcher joined them), bounded by a timeout — never a fixed guess
+    // driving the interleaving itself.
+    let dropped = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if count(&log, "child-dropped") >= 3 {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    assert!(dropped.is_ok(), "children joined after abort: {log:?}");
+
+    // The aborted dispatch surfaces an error (quarantine or host-closed
+    // once the actor retired), never a fabricated report.
+    let outcome = tokio::time::timeout(Duration::from_secs(5), dispatch)
+        .await
+        .expect("dispatch settles")
+        .expect("join");
+    assert!(outcome.is_err(), "{outcome:?}");
+}

@@ -338,13 +338,6 @@ fn register_child(children: &ChildTasks, handle: tokio::task::JoinHandle<()>) {
     children.lock().expect("cordis child registry").push(handle);
 }
 
-fn forget_child(children: &ChildTasks, id: tokio::task::Id) {
-    children
-        .lock()
-        .expect("cordis child registry")
-        .retain(|live| live.id() != id);
-}
-
 fn take_child(children: &ChildTasks, id: tokio::task::Id) -> Option<tokio::task::JoinHandle<()>> {
     let mut registry = children.lock().expect("cordis child registry");
     let position = registry.iter().position(|live| live.id() == id)?;
@@ -377,10 +370,12 @@ where
     (rx, id)
 }
 
-/// Settles one started child: awaits its completion channel, and when
-/// the child died before sending (panic or abort) joins its very handle
-/// to recover the panic payload. Either way the child is out of the
-/// registry by the time this returns.
+/// Settles one started child: awaits its completion channel, then joins
+/// the child's real handle in EVERY branch. The outcome may arrive while
+/// the child is still winding down — its async block drops user-owned
+/// locals only after the send, and a blocking `Drop` there delays the
+/// true exit — so the child stays in the registry until this join
+/// observes it, regardless of normal completion, panic or abort.
 async fn settle_child<T>(
     children: &ChildTasks,
     id: tokio::task::Id,
@@ -388,7 +383,15 @@ async fn settle_child<T>(
 ) -> Result<T, PluginError> {
     match rx.await {
         Ok(outcome) => {
-            forget_child(children, id);
+            if let Some(handle) = take_child(children, id) {
+                match handle.await {
+                    Ok(()) => {}
+                    Err(join_error) if join_error.is_panic() => {
+                        return Err(panic_to_plugin(join_error.into_panic()));
+                    }
+                    Err(_) => return Err(PluginError::from("handler task was cancelled")),
+                }
+            }
             outcome
         }
         Err(_) => match take_child(children, id) {
