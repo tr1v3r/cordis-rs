@@ -143,7 +143,7 @@ fn dump_value(value: &Json, key: &str, options: DumpOptions) -> String {
                 .collect();
             format!("[{}]", parts.join(", "))
         }
-        Json::String(text) if options.redact && is_sensitive_key(key) => "\"***\"".to_owned(),
+        Json::String(_) if options.redact && is_sensitive_key(key) => "\"***\"".to_owned(),
         other => serde_json::to_string(other).unwrap_or_else(|_| "<unencodable>".to_owned()),
     }
 }

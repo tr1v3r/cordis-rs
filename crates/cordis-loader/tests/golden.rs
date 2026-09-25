@@ -28,7 +28,9 @@ fn golden() -> String {
         "{}/tests/fixtures/golden_dump.txt",
         env!("CARGO_MANIFEST_DIR")
     );
-    std::fs::read_to_string(path).expect("golden dump exists")
+    std::fs::read_to_string(path)
+        .expect("golden dump exists")
+        .replace("\r\n", "\n")
 }
 
 /// Loads one scenario's layers and returns its dump with the header
