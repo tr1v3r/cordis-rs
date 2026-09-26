@@ -52,7 +52,7 @@ jobs:
       RUSTUP_TOOLCHAIN: stable
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         timeout-minutes: 5
 
       - name: Install stable Rust toolchain
@@ -89,7 +89,7 @@ jobs:
       RUSTUP_TOOLCHAIN: ${{ matrix.toolchain }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         timeout-minutes: 5
 
       - name: Install Rust toolchain (${{ matrix.toolchain }})
