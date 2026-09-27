@@ -188,6 +188,12 @@ fn plan_pair(
             old.disabled, new.disabled
         ));
     }
+    // Groups have no updatable config (their fiber is the builtin
+    // composition plugin; the subtree is captured at load time), so a
+    // changed group config can only take the recreate path.
+    if old.group && new.group && old.config != new.config {
+        recreate_reasons.push("group config changed: groups have no in-place update".to_owned());
+    }
     let path = prefix_with(prefix, &new.id);
     if !recreate_reasons.is_empty() {
         entries.push(PlanEntry {
@@ -566,6 +572,45 @@ mod tests {
         let desired = tree(r#"[{"id":"a","name":"p","disabled":true}]"#);
         let plan = plan(&current, &desired, 1).expect("plan");
         assert_eq!(plan.entries[0].action, Action::Recreate);
+    }
+
+    #[test]
+    fn group_config_change_recreates_not_updates() {
+        // Groups have no updatable config: their fiber is the builtin
+        // composition plugin with the subtree captured at load time, so
+        // a changed group config must recreate, never plan an update
+        // that would fail at apply time.
+        let current =
+            tree(r#"[{"id":"g","group":true,"config":{"x":1},"plugins":[{"id":"c","name":"p"}]}]"#);
+        let desired =
+            tree(r#"[{"id":"g","group":true,"config":{"x":2},"plugins":[{"id":"c","name":"p"}]}]"#);
+        let plan = plan(&current, &desired, 1).expect("plan");
+        let entry = plan.entries.iter().find(|e| e.id_path() == "g").unwrap();
+        assert_eq!(entry.action, Action::Recreate);
+        assert!(
+            entry
+                .reasons
+                .iter()
+                .any(|r| r.contains("group config changed")),
+            "{:?}",
+            entry.reasons
+        );
+        // The subtree is replaced as a whole: no child entries planned.
+        assert_eq!(plan.entries.len(), 1);
+    }
+
+    #[test]
+    fn reorder_within_a_level_keeps_identity() {
+        // docs/04 §4.3 lists definition/inject/scope/parent — not
+        // position — as identity-affecting: a pure reorder inside one
+        // level keeps every fiber (V49). This pins that contract.
+        let current =
+            tree(r#"[{"id":"a","name":"p"},{"id":"b","name":"p"},{"id":"c","name":"p"}]"#);
+        let desired =
+            tree(r#"[{"id":"c","name":"p"},{"id":"a","name":"p"},{"id":"b","name":"p"}]"#);
+        let plan = plan(&current, &desired, 1).expect("plan");
+        assert_eq!(plan.entries.len(), 3);
+        assert!(plan.entries.iter().all(|e| e.action == Action::Keep));
     }
 
     #[test]
