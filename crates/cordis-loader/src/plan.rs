@@ -188,6 +188,12 @@ fn plan_pair(
             old.disabled, new.disabled
         ));
     }
+    // Groups have no updatable config (their fiber is the builtin
+    // composition plugin; the subtree is captured at load time), so a
+    // changed group config can only take the recreate path.
+    if old.group && new.group && old.config != new.config {
+        recreate_reasons.push("group config changed: groups have no in-place update".to_owned());
+    }
     let path = prefix_with(prefix, &new.id);
     if !recreate_reasons.is_empty() {
         entries.push(PlanEntry {
@@ -269,26 +275,15 @@ pub fn plan_report(plan: &ReconcilePlan) -> ReconcileReport {
 }
 
 /// Renders ` config={...}` with sensitive values masked, or nothing for
-/// nodes without a config.
+/// nodes without a config. Masking walks the value tree (shared with
+/// dumps) so non-string and nested sensitive values are covered too.
 fn redact_suffix(config: &Json) -> String {
     if config.is_null() {
         return String::new();
     }
-    let mut text = serde_json::to_string(config).unwrap_or_default();
-    for key in crate::dump::SENSITIVE_KEYS {
-        let pattern = format!("\"{key}\":\"");
-        let mut cursor = 0;
-        while let Some(relative) = text[cursor..].find(&pattern) {
-            let value_start = cursor + relative + pattern.len();
-            let value_end = text[value_start..]
-                .find('"')
-                .map(|offset| value_start + offset)
-                .unwrap_or(text.len());
-            text.replace_range(value_start..value_end, "***");
-            // Continue past the masked value: the mask must not re-match.
-            cursor = value_start + "***".len();
-        }
-    }
+    let mut redacted = config.clone();
+    crate::dump::redact_json(&mut redacted);
+    let text = serde_json::to_string(&redacted).unwrap_or_default();
     format!(" config={text}")
 }
 
@@ -459,7 +454,26 @@ async fn load_desired(
         // disabled toggle is an unload without a load).
         return Ok(());
     }
-    let mounted_entry: MountedEntry = mount::mount_one(node, registry, ctx)
+    // Group children load inside the owning group's generation context
+    // (docs/04 §4.2: child fibers hang under the group generation's
+    // owner) — the group records its live context for exactly this.
+    // Top-level nodes and a missing group state fall back to the host
+    // context the reconcile itself runs under.
+    let group_ctx = if entry.path.len() > 1 {
+        mounted
+            .find_path(&entry.path[..entry.path.len() - 1])
+            .and_then(|parent| {
+                parent
+                    .group_state
+                    .as_ref()
+                    .map(|state| state.ctx.lock().expect("cordis loader group ctx").clone())
+            })
+            .flatten()
+    } else {
+        None
+    };
+    let load_ctx = group_ctx.as_ref().unwrap_or(ctx);
+    let mounted_entry: MountedEntry = mount::mount_one(node, registry, load_ctx)
         .await
         .map_err(|error| error.to_string())?;
     mounted.insert_entry(entry.path.clone(), mounted_entry);
@@ -550,12 +564,68 @@ mod tests {
     }
 
     #[test]
+    fn group_config_change_recreates_not_updates() {
+        // Groups have no updatable config: their fiber is the builtin
+        // composition plugin with the subtree captured at load time, so
+        // a changed group config must recreate, never plan an update
+        // that would fail at apply time.
+        let current =
+            tree(r#"[{"id":"g","group":true,"config":{"x":1},"plugins":[{"id":"c","name":"p"}]}]"#);
+        let desired =
+            tree(r#"[{"id":"g","group":true,"config":{"x":2},"plugins":[{"id":"c","name":"p"}]}]"#);
+        let plan = plan(&current, &desired, 1).expect("plan");
+        let entry = plan.entries.iter().find(|e| e.id_path() == "g").unwrap();
+        assert_eq!(entry.action, Action::Recreate);
+        assert!(
+            entry
+                .reasons
+                .iter()
+                .any(|r| r.contains("group config changed")),
+            "{:?}",
+            entry.reasons
+        );
+        // The subtree is replaced as a whole: no child entries planned.
+        assert_eq!(plan.entries.len(), 1);
+    }
+
+    #[test]
+    fn reorder_within_a_level_keeps_identity() {
+        // docs/04 §4.3 lists definition/inject/scope/parent — not
+        // position — as identity-affecting: a pure reorder inside one
+        // level keeps every fiber (V49). This pins that contract.
+        let current =
+            tree(r#"[{"id":"a","name":"p"},{"id":"b","name":"p"},{"id":"c","name":"p"}]"#);
+        let desired =
+            tree(r#"[{"id":"c","name":"p"},{"id":"a","name":"p"},{"id":"b","name":"p"}]"#);
+        let plan = plan(&current, &desired, 1).expect("plan");
+        assert_eq!(plan.entries.len(), 3);
+        assert!(plan.entries.iter().all(|e| e.action == Action::Keep));
+    }
+
+    #[test]
     fn id_less_nodes_cannot_be_planned() {
         let current = tree(r#"[{"name":"anon","name_":"x"}]"#);
         // name-only entry: no id → plan refuses.
         let desired = tree(r#"[{"name":"anon"}]"#);
         let err = plan(&current, &desired, 1).expect_err("no ids");
         assert!(matches!(err, LoaderError::MissingNodeId { .. }));
+    }
+
+    #[test]
+    fn dry_run_redacts_non_string_and_nested_sensitive_values() {
+        let current = tree(r#"[{"id":"a","name":"p","config":{"v":1}}]"#);
+        let desired = tree(
+            r#"[{"id":"a","name":"p","config":{"v":2,"apikey":12345,"credential":{"user":"u","pass":"p"}}}]"#,
+        );
+        let plan = plan(&current, &desired, 1).expect("plan");
+        let text = plan_report(&plan).render();
+        assert!(text.contains("\"apikey\":\"***\""), "{text}");
+        assert!(!text.contains("12345"), "numeric token leaked: {text}");
+        assert!(
+            !text.contains("\"pass\":\"p\"") && !text.contains("\"user\":\"u\""),
+            "nested credential leaked: {text}"
+        );
+        assert!(text.contains("\"credential\":\"***\""), "{text}");
     }
 
     #[test]
