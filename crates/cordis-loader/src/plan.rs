@@ -275,26 +275,15 @@ pub fn plan_report(plan: &ReconcilePlan) -> ReconcileReport {
 }
 
 /// Renders ` config={...}` with sensitive values masked, or nothing for
-/// nodes without a config.
+/// nodes without a config. Masking walks the value tree (shared with
+/// dumps) so non-string and nested sensitive values are covered too.
 fn redact_suffix(config: &Json) -> String {
     if config.is_null() {
         return String::new();
     }
-    let mut text = serde_json::to_string(config).unwrap_or_default();
-    for key in crate::dump::SENSITIVE_KEYS {
-        let pattern = format!("\"{key}\":\"");
-        let mut cursor = 0;
-        while let Some(relative) = text[cursor..].find(&pattern) {
-            let value_start = cursor + relative + pattern.len();
-            let value_end = text[value_start..]
-                .find('"')
-                .map(|offset| value_start + offset)
-                .unwrap_or(text.len());
-            text.replace_range(value_start..value_end, "***");
-            // Continue past the masked value: the mask must not re-match.
-            cursor = value_start + "***".len();
-        }
-    }
+    let mut redacted = config.clone();
+    crate::dump::redact_json(&mut redacted);
+    let text = serde_json::to_string(&redacted).unwrap_or_default();
     format!(" config={text}")
 }
 
@@ -620,6 +609,23 @@ mod tests {
         let desired = tree(r#"[{"name":"anon"}]"#);
         let err = plan(&current, &desired, 1).expect_err("no ids");
         assert!(matches!(err, LoaderError::MissingNodeId { .. }));
+    }
+
+    #[test]
+    fn dry_run_redacts_non_string_and_nested_sensitive_values() {
+        let current = tree(r#"[{"id":"a","name":"p","config":{"v":1}}]"#);
+        let desired = tree(
+            r#"[{"id":"a","name":"p","config":{"v":2,"apikey":12345,"credential":{"user":"u","pass":"p"}}}]"#,
+        );
+        let plan = plan(&current, &desired, 1).expect("plan");
+        let text = plan_report(&plan).render();
+        assert!(text.contains("\"apikey\":\"***\""), "{text}");
+        assert!(!text.contains("12345"), "numeric token leaked: {text}");
+        assert!(
+            !text.contains("\"pass\":\"p\"") && !text.contains("\"user\":\"u\""),
+            "nested credential leaked: {text}"
+        );
+        assert!(text.contains("\"credential\":\"***\""), "{text}");
     }
 
     #[test]

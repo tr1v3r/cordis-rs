@@ -134,6 +134,10 @@ fn dump_config(config: &serde_json::Map<String, Json>, options: DumpOptions) -> 
 
 fn dump_value(value: &Json, key: &str, options: DumpOptions) -> String {
     match value {
+        // Sensitive values are masked whatever their shape: a numeric
+        // token or a nested credential object leaks just as much as a
+        // string does.
+        _ if options.redact && is_sensitive_key(key) => "\"***\"".to_owned(),
         Json::Null => "null".to_owned(),
         Json::Object(map) => dump_config(map, options),
         Json::Array(items) => {
@@ -143,13 +147,27 @@ fn dump_value(value: &Json, key: &str, options: DumpOptions) -> String {
                 .collect();
             format!("[{}]", parts.join(", "))
         }
-        Json::String(_) if options.redact && is_sensitive_key(key) => "\"***\"".to_owned(),
         other => serde_json::to_string(other).unwrap_or_else(|_| "<unencodable>".to_owned()),
     }
 }
 
 fn is_sensitive_key(key: &str) -> bool {
     SENSITIVE_KEYS.contains(&key)
+}
+
+/// Masks the value of every sensitive key anywhere inside `value`,
+/// whatever the value's shape (string, number, composite). Shared by
+/// dumps and dry-run rendering so both redact identically.
+pub(crate) fn redact_json(value: &mut Json) {
+    if let Json::Object(map) = value {
+        for (key, child) in map.iter_mut() {
+            if is_sensitive_key(key) {
+                *child = Json::String("***".to_owned());
+            } else {
+                redact_json(child);
+            }
+        }
+    }
 }
 
 fn quote(value: &str) -> String {
