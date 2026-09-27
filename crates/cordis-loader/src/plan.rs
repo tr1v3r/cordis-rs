@@ -459,7 +459,26 @@ async fn load_desired(
         // disabled toggle is an unload without a load).
         return Ok(());
     }
-    let mounted_entry: MountedEntry = mount::mount_one(node, registry, ctx)
+    // Group children load inside the owning group's generation context
+    // (docs/04 §4.2: child fibers hang under the group generation's
+    // owner) — the group records its live context for exactly this.
+    // Top-level nodes and a missing group state fall back to the host
+    // context the reconcile itself runs under.
+    let group_ctx = if entry.path.len() > 1 {
+        mounted
+            .find_path(&entry.path[..entry.path.len() - 1])
+            .and_then(|parent| {
+                parent
+                    .group_state
+                    .as_ref()
+                    .map(|state| state.ctx.lock().expect("cordis loader group ctx").clone())
+            })
+            .flatten()
+    } else {
+        None
+    };
+    let load_ctx = group_ctx.as_ref().unwrap_or(ctx);
+    let mounted_entry: MountedEntry = mount::mount_one(node, registry, load_ctx)
         .await
         .map_err(|error| error.to_string())?;
     mounted.insert_entry(entry.path.clone(), mounted_entry);

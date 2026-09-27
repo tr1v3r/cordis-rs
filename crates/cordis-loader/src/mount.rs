@@ -48,7 +48,6 @@ impl std::fmt::Debug for MountedEntry {
 
 pub(crate) struct MountedEntryInner {
     pub(crate) id: String,
-    pub(crate) name: String,
     pub(crate) group: bool,
     handle: Mutex<Option<crate::registry::SharedHandle>>,
     // `Arc<dyn MountedHandle>` clones cheaply, so awaits never hold the lock.
@@ -58,7 +57,6 @@ pub(crate) struct MountedEntryInner {
 impl MountedEntry {
     pub(crate) fn new(
         id: &str,
-        name: &str,
         group: bool,
         handle: Box<dyn MountedHandle>,
         group_state: Option<Arc<GroupState>>,
@@ -66,7 +64,6 @@ impl MountedEntry {
         Self {
             inner: Arc::new(MountedEntryInner {
                 id: id.to_owned(),
-                name: name.to_owned(),
                 group,
                 handle: Mutex::new(Some(Arc::from(handle))),
                 group_state,
@@ -160,54 +157,87 @@ impl MountedTree {
     }
 
     /// Removes a top-level entry (removals of group children drop them
-    /// from the group state during dispose).
+    /// from the group state during dispose). The path is walked level by
+    /// level: a nested child (g/g2/c) is removed from its direct owner,
+    /// not from the outermost group.
     pub(crate) fn remove_path(&mut self, path: &[String]) {
-        let Some(first) = path.first() else { return };
-        if path.len() == 1 {
+        let Some((first, rest)) = path.split_first() else {
+            return;
+        };
+        if rest.is_empty() {
             self.entries.retain(|entry| entry.id() != *first);
             return;
         }
         // Group child: drop it from the owning group's recorded children.
         if let Some(entry) = self.entries.iter().find(|entry| entry.id() == *first) {
             if let Some(state) = &entry.inner().group_state {
-                state
-                    .children
-                    .lock()
-                    .unwrap()
-                    .retain(|child| child.id != path[path.len() - 1]);
+                remove_child_from(&state.children, rest);
             }
         }
     }
 
     /// Records a newly mounted entry at `path`: top-level entries join
-    /// the tree; group children join the owning group's live state.
+    /// the tree; group children join the owning group's live state. The
+    /// path is walked level by level so nested groups (g/g2/c) record
+    /// under their direct owner.
     pub(crate) fn insert_entry(&mut self, path: Vec<String>, mounted: MountedEntry) {
         if path.len() == 1 {
             self.entries.push(mounted);
             return;
         }
-        let id = path[path.len() - 1].clone();
         if let Some(entry) = self.entries.iter().find(|entry| entry.id() == path[0]) {
-            if let Some(state) = &entry.inner().group_state {
-                state
-                    .children
-                    .lock()
-                    .unwrap()
-                    .push(mounted.inner_with_id(id));
-            }
+            insert_child_under(&entry.inner().group_state, &path[1..], mounted.inner());
         }
     }
 }
 
-impl MountedEntry {
-    pub(crate) fn inner_with_id(self, id: String) -> Arc<MountedEntryInner> {
-        Arc::new(MountedEntryInner {
-            id,
-            name: self.inner.name.clone(),
-            group: self.inner.group,
-            handle: Mutex::new(self.inner.take_handle()),
-            group_state: self.inner.group_state.clone(),
-        })
+/// Drops the child addressed by `rest` from the owning group's children,
+/// recursing through nested group state.
+fn remove_child_from(children: &Mutex<Vec<Arc<MountedEntryInner>>>, rest: &[String]) {
+    let Some((first, tail)) = rest.split_first() else {
+        return;
+    };
+    let mut guard = children.lock().unwrap();
+    if tail.is_empty() {
+        guard.retain(|child| child.id != *first);
+        return;
+    }
+    let nested = guard
+        .iter()
+        .find(|child| child.id == *first)
+        .and_then(|child| child.group_state.clone());
+    drop(guard);
+    if let Some(state) = nested {
+        remove_child_from(&state.children, tail);
+    }
+}
+
+/// Records `inner` under the group state addressed by `rest` (the last
+/// path segment names the new child; earlier ones navigate groups).
+fn insert_child_under(
+    state: &Option<Arc<GroupState>>,
+    rest: &[String],
+    inner: Arc<MountedEntryInner>,
+) {
+    let Some((first, tail)) = rest.split_first() else {
+        return;
+    };
+    let Some(state) = state else {
+        return;
+    };
+    if tail.is_empty() {
+        state.children.lock().unwrap().push(inner);
+        return;
+    }
+    let nested = state
+        .children
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|child| child.id == *first)
+        .and_then(|child| child.group_state.clone());
+    if let Some(nested) = nested {
+        insert_child_under(&Some(nested), tail, inner);
     }
 }
 
@@ -231,7 +261,7 @@ pub(crate) async fn mount_one(
     let config = Json::Object(node.config.clone().unwrap_or_default());
     let handle = (registered.load)(ctx, &config).await?;
     await_group_child_activation(handle.as_ref(), node).await?;
-    Ok(MountedEntry::new(&node.id, &node.name, false, handle, None))
+    Ok(MountedEntry::new(&node.id, false, handle, None))
 }
 
 /// Public outcome-kind naming shared with the plan module's reports.
@@ -368,7 +398,7 @@ async fn mount_nodes(
         };
         await_activation(handle.as_ref(), node, registry, report).await?;
         report.mounted.push(node.describe().to_owned());
-        entries.push(MountedEntry::new(&node.id, &node.name, false, handle, None));
+        entries.push(MountedEntry::new(&node.id, false, handle, None));
     }
     Ok(())
 }
@@ -466,7 +496,6 @@ async fn mount_group_inner(
     }
     Ok(MountedEntry::new(
         &node.id,
-        "cordis.group",
         true,
         Box::new(FiberHandleAdapter {
             handle: receipt.fiber,
@@ -544,7 +573,7 @@ async fn load_children(
                     .children
                     .lock()
                     .unwrap()
-                    .push(MountedEntry::new(&node.id, &node.name, false, handle, None).inner());
+                    .push(MountedEntry::new(&node.id, false, handle, None).inner());
                 Ok(())
             }
         }

@@ -425,3 +425,85 @@ async fn v52_quarantine_during_reconcile_disposal_is_reported_honestly() {
         .await
         .expect("shutdown");
 }
+
+#[tokio::test]
+async fn nested_group_children_reconcile_at_depth_three() {
+    // L2: children of a nested group (g/g2/c) must be addressable by
+    // path through every intermediate group — updates resolve, inserts
+    // record under the direct owner (and load in the group's context),
+    // removals drop the right child.
+    let app = App::builder().build().expect("app builds");
+    let root = app.context();
+    let (registry, activations) = registry_with_counter();
+
+    let current = tree(
+        r#"[{"id":"g","group":true,"plugins":[{"id":"g2","group":true,"plugins":[{"id":"c","name":"p","config":{"value":1}}]}]}]"#,
+    );
+    let mut mounted = mount(&current, &registry, &root).await.expect("mount");
+    assert_eq!(activations.load(Ordering::SeqCst), 1);
+
+    // Update the depth-three child and insert a sibling under g2.
+    let desired = tree(
+        r#"[{"id":"g","group":true,"plugins":[{"id":"g2","group":true,"plugins":[{"id":"c","name":"p","config":{"value":2}},{"id":"c2","name":"p"}]}]}]"#,
+    );
+    let planned = plan(&current, &desired, mounted.revision()).expect("plan");
+    assert!(
+        planned
+            .entries
+            .iter()
+            .any(|e| e.id_path() == "g/g2/c" && e.action == Action::Update),
+        "{:?}",
+        planned.entries
+    );
+    assert!(
+        planned
+            .entries
+            .iter()
+            .any(|e| e.id_path() == "g/g2/c2" && e.action == Action::Insert),
+        "{:?}",
+        planned.entries
+    );
+    let report = reconcile(&mut mounted, planned, &desired, &registry, &root)
+        .await
+        .expect("apply");
+    assert!(report.is_clean(), "{report:?}");
+    // c re-activates once for the update, c2 activates once for the
+    // insert: three activations in total so far.
+    assert_eq!(activations.load(Ordering::SeqCst), 3);
+
+    // The inserted child must be recorded under g2 (its direct owner):
+    // a second reconcile updating c2 resolves through g/g2/c2, and
+    // removing c drops exactly c — both would misfire if the insert had
+    // landed one level up.
+    let second = tree(
+        r#"[{"id":"g","group":true,"plugins":[{"id":"g2","group":true,"plugins":[{"id":"c2","name":"p","config":{"value":9}}]}]}]"#,
+    );
+    let planned = plan(&desired, &second, mounted.revision()).expect("plan");
+    assert!(
+        planned
+            .entries
+            .iter()
+            .any(|e| e.id_path() == "g/g2/c2" && e.action == Action::Update),
+        "{:?}",
+        planned.entries
+    );
+    assert!(
+        planned
+            .entries
+            .iter()
+            .any(|e| e.id_path() == "g/g2/c" && e.action == Action::Remove),
+        "{:?}",
+        planned.entries
+    );
+    let report = reconcile(&mut mounted, planned, &second, &registry, &root)
+        .await
+        .expect("apply");
+    assert!(report.is_clean(), "{report:?}");
+    // c2 re-activates for its update; removing c disposes without a new
+    // activation: four in total.
+    assert_eq!(activations.load(Ordering::SeqCst), 4);
+
+    app.shutdown(cordis_core::ShutdownOptions::default())
+        .await
+        .expect("shutdown");
+}
