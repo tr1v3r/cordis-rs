@@ -544,6 +544,7 @@ impl FiberRecord {
         if self.state.is_terminal() {
             return;
         }
+        self.retire_terminal_user_values(fx);
         self.set_state(FiberState::Quarantined);
         self.last_error = Some(reason.to_owned());
         let outcome = Arc::new(OperationOutcome::Quarantined {
@@ -555,6 +556,31 @@ impl FiberRecord {
         self.resolve_dispose_ops(Arc::clone(&outcome), fx);
         self.final_outcome = Some(outcome);
         fx.terminal = Some(FiberState::Quarantined);
+    }
+
+    /// Terminal quarantine lands without a confirmed release, but no
+    /// user code will ever run for this fiber again: the still-held
+    /// user-owned references (desired configuration, plugin definition)
+    /// move off the actor through the retire lane exactly like the
+    /// `Disposed` landing (D22). Arc lifetimes elsewhere (a stuck worker
+    /// holding a clone) are untouched — retiring only gives up this
+    /// record's reference.
+    fn retire_terminal_user_values(&mut self, fx: &mut StepEffects) {
+        // A deadline quarantine may land while a generation is still
+        // tracked (its worker was aborted, not joined): retire that
+        // generation's config too. Later paths are no-ops — the config
+        // is already released there.
+        if let Some(g) = self.generation.as_mut() {
+            if let Some(config) = g.config.take() {
+                fx.retire.push(Box::new(config));
+            }
+        }
+        if let Some(config) = self.desired.config.take() {
+            fx.retire.push(Box::new(config));
+        }
+        if let Some(plugin) = self.plugin.take() {
+            fx.retire.push(Box::new(plugin));
+        }
     }
 
     /// Fails the tracked generation (supervised task `Err`/panic): the
@@ -716,6 +742,7 @@ impl FiberRecord {
                 if let Some(config) = g.config.take() {
                     fx.retire.push(Box::new(config));
                 }
+                self.retire_terminal_user_values(fx);
                 self.set_state(FiberState::Quarantined);
                 let outcome = Arc::new(OperationOutcome::Quarantined {
                     cleanup: CleanupReport {
@@ -778,6 +805,7 @@ impl FiberRecord {
         // A drain ended with unconfirmed releases: quarantine, never
         // Disposed/Failed, never a new generation (I11/D10).
         if let Some(report) = self.drain_quarantine.take() {
+            self.retire_terminal_user_values(fx);
             self.set_state(FiberState::Quarantined);
             let outcome = Arc::new(OperationOutcome::Quarantined { cleanup: report });
             self.resolve_dispose_ops(Arc::clone(&outcome), fx);
@@ -818,6 +846,7 @@ impl FiberRecord {
                 return;
             }
             if self.saw_quarantined_child {
+                self.retire_terminal_user_values(fx);
                 self.set_state(FiberState::Quarantined);
                 let outcome = Arc::new(OperationOutcome::Quarantined {
                     cleanup: CleanupReport {
