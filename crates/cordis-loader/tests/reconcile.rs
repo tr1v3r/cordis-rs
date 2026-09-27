@@ -360,3 +360,68 @@ async fn v44_big_numbers_survive_into_typed_configs() {
         .await
         .expect("shutdown");
 }
+
+#[tokio::test]
+async fn v52_quarantine_during_reconcile_disposal_is_reported_honestly() {
+    // A removed node whose cleanup refuses must surface as a quarantine
+    // in the apply report — never as a clean removal (V52). This pins
+    // the dispose_entry fix: the real per-node fiber state flows back.
+    let app = App::builder().build().expect("app builds");
+    let root = app.context();
+    let (mut registry, _) = registry_with_counter();
+    registry
+        .register(
+            "dirty",
+            define("dirty", |ctx, _cfg: Arc<Cfg>| async move {
+                ctx.on_dispose("dirty-cleanup", || async {
+                    Err(cordis_core::CleanupError::from("cleanup refused"))
+                })
+                .await?;
+                Ok(())
+            }),
+            |_config| Ok(Cfg { value: 0 }),
+        )
+        .expect("register dirty");
+
+    let current = tree(r#"[{"id":"d","name":"dirty"},{"id":"a","name":"p"}]"#);
+    let mut mounted = mount(&current, &registry, &root).await.expect("mount");
+
+    // Desired tree drops "d": the disposal quarantines.
+    let desired = tree(r#"[{"id":"a","name":"p"}]"#);
+    let planned = plan(&current, &desired, mounted.revision()).expect("plan");
+    let report = reconcile(&mut mounted, planned, &desired, &registry, &root)
+        .await
+        .expect("apply completes with a per-node failure");
+    assert!(!report.is_clean(), "{report:?}");
+    assert!(
+        report.quarantined.iter().any(|id| id == "d"),
+        "quarantine must be reported, not swallowed: {report:?}"
+    );
+    let failure = report
+        .outcomes
+        .iter()
+        .find(|outcome| outcome.id == "d")
+        .expect("d has an outcome");
+    assert!(
+        failure
+            .result
+            .as_ref()
+            .is_err_and(|reason| reason.contains("quarantined")),
+        "the removal must carry the real state: {:?}",
+        failure.result
+    );
+    // The quarantined node keeps its bookkeeping entry (its real state
+    // is quarantined, not vanished) but holds no live fiber, and the
+    // survivor is untouched.
+    assert!(mounted.find("d").is_some());
+    assert!(
+        mounted.find("d").expect("d").fiber_id().is_none(),
+        "the quarantined node must have no live fiber"
+    );
+    assert!(mounted.find("a").is_some());
+    assert_eq!(report.revision, 2);
+
+    app.shutdown(cordis_core::ShutdownOptions::default())
+        .await
+        .expect("shutdown");
+}

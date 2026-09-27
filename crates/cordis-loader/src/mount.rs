@@ -612,7 +612,7 @@ pub(crate) async fn dispose_entry(
         return FiberState::Disposed;
     };
     let fiber = handle.fiber_id();
-    match handle.dispose().await {
+    let state = match handle.dispose().await {
         Ok(operation) => match operation.wait().await {
             Ok(outcome) => match &*outcome {
                 cordis_core::OperationOutcome::Disposed { .. } => {
@@ -643,7 +643,7 @@ pub(crate) async fn dispose_entry(
         }
     };
     let _ = fiber;
-    FiberState::Disposed
+    state
 }
 
 fn outcome_kind(outcome: &cordis_core::OperationOutcome) -> &'static str {
