@@ -153,12 +153,19 @@ impl Composer {
         for child_patch in &patch.plugins {
             if !child_patch.insert.is_empty() {
                 // A nested insert appends into this node's children.
+                // Duplicate ids are first-wins with a diagnostic, exactly
+                // like top-level inserts (Go parity).
                 for inserted_entry in &child_patch.insert {
+                    if !inserted_entry.id.is_empty() && self.index.contains(&inserted_entry.id) {
+                        self.warn(format!(
+                            "layer {source:?}: duplicate entry id {:?}",
+                            inserted_entry.id
+                        ))?;
+                        continue;
+                    }
                     let node_child = create_node(inserted_entry, source, "inserted entry")?;
                     let ids = subtree_ids(&node_child);
-                    let insert_index = self.node_mut(&path).children.len();
                     self.node_mut(&path).children.push(node_child);
-                    let _ = insert_index;
                     for id in ids {
                         if !id.is_empty() {
                             self.index.insert(id);
@@ -576,6 +583,37 @@ mod tests {
         .expect("base");
         let err = compose(&[strict], ComposeOptions { strict: true }).expect_err("strict");
         assert!(matches!(err, LoaderError::Compose { .. }));
+    }
+
+    #[test]
+    fn nested_insert_duplicate_id_warns_first_wins() {
+        // A nested insert (inside a patch of a group) with an id that
+        // already exists must be diagnosed like a top-level insert:
+        // first-wins, the duplicate is skipped with a warning.
+        let base = Layer::parse(
+            "base",
+            r#"[{"id":"g","group":true,"plugins":[{"id":"c1","name":"p"}]}]"#,
+        )
+        .expect("base");
+        let profile = Layer::parse_patch(
+            "profile",
+            r#"[{"id":"g","plugins":[{"insert":[{"id":"c1","name":"other"},{"id":"c2","name":"p"}]}]}]"#,
+        )
+        .expect("profile");
+        let tree = compose(&[base, profile], ComposeOptions::default()).expect("compose");
+        let group = tree.find("g").expect("group");
+        // First-wins: the original c1 (plugin p) survives, the duplicate
+        // insert is skipped, c2 lands.
+        let c1 = group.children.iter().find(|c| c.id == "c1").unwrap();
+        assert_eq!(c1.name, "p");
+        assert!(group.children.iter().any(|c| c.id == "c2"));
+        assert!(
+            tree.warnings
+                .iter()
+                .any(|w| w.contains("duplicate entry id \"c1\"")),
+            "duplicate nested insert must warn: {:?}",
+            tree.warnings
+        );
     }
 
     #[test]
