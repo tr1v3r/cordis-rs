@@ -2752,6 +2752,11 @@ impl Coordinator {
             if let Some(drain) = self.drains.get_mut(&id) {
                 drain.next_cleanup += 1;
             }
+            // The taken cleanup is still a user-owned value and this
+            // entry is terminal: its final Drop must never run on the
+            // actor (D22). Retire it off the critical path like every
+            // other refused release instead of dropping it inline.
+            self.retire.submit(Box::new(cleanup));
             return true;
         }
         let ticket = supervisor::spawn_cleanup(next_entry, cleanup, self.internal_tx.clone());
