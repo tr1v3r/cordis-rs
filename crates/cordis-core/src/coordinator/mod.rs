@@ -1704,9 +1704,29 @@ impl Coordinator {
 
         // Entry published; user code may start (docs/03 §6.1).
         if let Some(setup) = setup_to_spawn {
-            let ctx = Context::effect_scope(self.app.clone(), fiber, generation, id, scopes);
-            let ticket = supervisor::spawn_setup(id, setup, ctx, gate, self.internal_tx.clone());
-            self.workers.insert(WorkerKey::Setup(id), ticket);
+            if self.workers.len() >= self.limits.max_workers {
+                // Refuse the spawn exactly like activation, managed
+                // starts, dispatches, tasks and cleanups: the live-worker
+                // budget is an invariant, not a hint. A refused setup
+                // never ran user code, so the entry lands Sealed with a
+                // recorded failure the next drain surfaces once.
+                if let Some(entry) = self.effects.get_mut(&id) {
+                    entry.setup_failed = Some(format!(
+                        "setup refused: live worker budget ({}) exhausted",
+                        self.limits.max_workers
+                    ));
+                    if entry.state == EntryState::Preparing {
+                        entry.state = EntryState::Sealed;
+                    }
+                }
+                self.satisfy_drain_wait(&QuiesceWait::Setup(id));
+                self.drive_drains();
+            } else {
+                let ctx = Context::effect_scope(self.app.clone(), fiber, generation, id, scopes);
+                let ticket =
+                    supervisor::spawn_setup(id, setup, ctx, gate, self.internal_tx.clone());
+                self.workers.insert(WorkerKey::Setup(id), ticket);
+            }
         }
         if let Some(task) = task_to_start {
             self.start_task(id, task);
